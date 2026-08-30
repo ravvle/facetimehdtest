@@ -998,6 +998,27 @@ if wants controls; then
                     # signal either setting could act on. Says nothing about AE.
                     result WARN controls.ae.effect \
                         "both readings floored at 0 - camera was fully covered, re-run and only partly shade it"
+                elif [ -n "$base_manual" ] && [ -n "$dark_manual" ] &&
+                     awk -v l="$base_manual" -v d="$dark_manual" \
+                         'BEGIN{exit !(d+0 >= l+0 - 5)}'; then
+                    # The manual pair is the control: with AE off, shading the
+                    # lens must pull luma down. If it did not, the shade was
+                    # never on the lens for that reading - so manual(dark) and
+                    # auto(dark) sampled different scenes, and their difference
+                    # is a lighting artefact that would otherwise be scored as
+                    # AE running backwards.
+                    result WARN controls.ae.effect \
+                        "shading did not darken the MANUAL reading ($base_manual -> $dark_manual) - the shade was not on the lens for it, so the two dark readings are different scenes; re-run and hold the shade steady across both"
+                elif [ -n "$dark_manual" ] && [ -n "$dark_auto" ] &&
+                     awk -v m="$dark_manual" -v a="$dark_auto" \
+                         'BEGIN{exit !(a+0 < 1 && m+0 >= 1)}'; then
+                    # Only the AUTO reading floored: the lens was covered far
+                    # harder for it than for the manual one. Same reason as the
+                    # both-floored case - no photons, nothing for AE to
+                    # amplify - but it would otherwise land in the "backwards"
+                    # branch below and read as an AE fault.
+                    result WARN controls.ae.effect \
+                        "AUTO reading floored at $dark_auto while MANUAL held $dark_manual - the lens was covered harder for the AUTO step, re-run with the same partial shade for both"
                 elif [ -n "$dark_manual" ] && [ -n "$dark_auto" ]; then
                     if awk -v a="$dark_auto" -v m="$dark_manual" \
                            'BEGIN{exit !(a > m + 5)}'; then
@@ -2673,8 +2694,18 @@ if wants nv12; then
 
         # Index 0 is what an application that takes the first format offered
         # ends up with, and NV12 is meant to be that format now.
+        #
+        # --list-formats has two layouts and both must be read, because a
+        # layout this cannot parse yields an empty string that reads as a
+        # driver enumerating the wrong format. v4l2-utils <= 1.22 prints a
+        # labelled block ("Pixel Format: 'NV12'"); 1.32 prints
+        # "[0]: 'NV12' (Y/UV 4:2:0)". The labelled form is still what
+        # --get-fmt-video prints, which is why fmt_field() needs no such pair.
+        # Both are enumeration-ordered, so head -1 is index 0 either way.
         nv12_first="$(v4l2-ctl --device "$DEVICE" --list-formats 2>/dev/null |
-            sed -n "s/^[[:space:]]*Pixel Format[[:space:]]*:[[:space:]]*'\([^']*\)'.*/\1/p" |
+            sed -n \
+                -e "s/^[[:space:]]*\[[0-9]\{1,\}\][[:space:]]*:[[:space:]]*'\([^']*\)'.*/\1/p" \
+                -e "s/^[[:space:]]*Pixel Format[[:space:]]*:[[:space:]]*'\([^']*\)'.*/\1/p" |
             head -1)"
         if [ "$nv12_first" = NV12 ]; then
             result PASS nv12.first "NV12 is the first format enumerated"

@@ -597,6 +597,10 @@ Validated on a MacBookAir7,2, firmware 1.43.0, Ubuntu kernels in the
   every retained control value;
 - YUYV, YVYU and NV12, each with the fourcc surviving `G_FMT`, the NV12 planes
   inspected separately at their 4:2:0 extents against a YUYV reference;
+- NV12 as the format nobody negotiates: a freshly loaded driver reports it,
+  `ENUM_FMT` offers it at index 0, and the suite runs end to end from that
+  starting state, so every section above is measured through the semi-planar
+  layout an application gets by taking whatever comes first;
 - frame-rate decimation at divisors 1, 2, 3, 5, 10 and 30, every measured rate
   within 1.7% of the request and `G_PARM` reporting the divisor-derived rate
   exactly, with nothing starving even at divisor 30 (29 of every 30 frames
@@ -629,12 +633,6 @@ Still open:
   rectangle being the sensor array, the crop centre rule, and
   `awb_cct_estimate` reading kelvin (read-only, so a wrong unit misinforms
   rather than misconfigures).
-- **The format default itself.** Every NV12 capture check above passed, but it
-  passed for a format an application had to name. It is now what
-  `v4l2-compliance`, `tests/smoke-capture.sh` and anything that takes the first
-  offered format will negotiate, and no run has exercised the suite end to end
-  from that starting state. `hw-validate.sh` gained `probe.default_fmt` and
-  `nv12.first` for it; neither has hardware behind it yet.
 - **Whether code 0 is the pipeline's native sampling**, or a downsample of a
   genuinely 4:2:2 chroma stream. Every measurement so far is of what the ISP
   wrote - plane extents, and chroma *means* agreeing with a YUYV reference -
@@ -645,6 +643,15 @@ Still open:
   capture that would settle it: fine horizontal chroma structure, compared
   chroma row against chroma row in both formats rather than by mean.
 - The visible effect of anti-banding and exposure mode under controlled light.
+  `controls.ae.effect` compares a manual and an auto reading of the same dimmed
+  scene, so it needs a *partial* attenuation held steady across both. A hand at
+  the lens does not give one - it either misses the lens, leaving the manual
+  reading as bright as the lit one, or covers it completely and floors both
+  readings at 0.0 luma, where auto-exposure has no signal to amplify and
+  neither setting can be told from the other. Dimming the room, or a
+  translucent diffuser laid over the lens, is the stimulus the check wants. Its
+  guards report an unusable stimulus as such, so AE is unmeasured here rather
+  than recorded as working or broken.
 - Whether AE metering modes `0..3` are visibly distinct. They are accepted and
   persistent, but across a controlled high-contrast scene the largest cross-mode
   spreads were 1.2 luma full-frame, 0.7 central-spot and 1.5 outer - compatible
