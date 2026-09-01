@@ -1,0 +1,617 @@
+From 6078e713042d501c71d8e20fe245466c25154f8e Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 19/19] debugfs: add the same-value setter and metering harness
+
+Identifying a firmware setter needs a way to exercise it that cannot itself
+be the thing that breaks the machine. Five root-write-only mode-0200 nodes
+do that: roundtrip_ae_bias, roundtrip_ae_metering_mode,
+roundtrip_ae_integration_time_max, roundtrip_ae_gain_cap and
+roundtrip_ae_gain_cap_min.
+
+They accept no numeric input - the only valid write is the literal word
+"same". Under ioctl_lock and an active-stream check, the kernel GETs the
+current value, SETs that exact value once, GETs again, and fails on
+mismatch. Userspace cannot choose an out-of-range value or make two gain
+limits cross, and nothing happens at module load, STREAMON or resume.
+
+test_ae_metering_mode and test_ae_metering_mode_restart are the one
+non-current-value experiment, deliberately limited to AE metering modes 0..3
+- the closed domain recovered from this firmware, whose mode 3 the
+established channel-start sequence already programs. They accept only the
+fixed tokens mode0 through mode3, reject numeric parsing, and verify the
+mode reads back exactly. The _restart variant stops AE, sets the mode,
+restarts AE and re-GETs, because the normal channel sequence programs
+metering before AE starts while the plain node mutates it with AE already
+running.
+
+The command wrappers this needs come with it, along with the recovered
+payload layouts for setters that stay unexposed - sharpness, test pattern,
+noise reduction, chroma suppression, DRC strength, manual integration time,
+manual gain and manual AWB CCT. Nominal GET slots for the first four are
+deliberately absent: this firmware's dispatcher routes those opcodes to its
+unsupported-command block even though the names exist in the recovered enum,
+so every image-processing setter it implements is write-only, with no way to
+restore a default except by reloading firmware. That is exactly why none of
+them is wired to a control.
+
+All of this is scaffolding, not ABI: no V4L2 control is registered and
+nothing is replayed. Remove it or keep it debug-only once the command
+semantics are established.
+---
+ fthd_debugfs.c | 286 +++++++++++++++++++++++++++++++++++++++++++++++++
+ fthd_isp.c     | 160 +++++++++++++++++++++++++++
+ fthd_isp.h     |  60 +++++++++++
+ 3 files changed, 506 insertions(+)
+
+diff --git a/fthd_debugfs.c b/fthd_debugfs.c
+index da103cb..db4ff9a 100644
+--- a/fthd_debugfs.c
++++ b/fthd_debugfs.c
+@@ -257,6 +257,13 @@ enum fthd_fw_readback {
+ 	FTHD_FW_CROP,
+ };
+ 
++enum fthd_fw_roundtrip {
++	FTHD_FW_ROUNDTRIP_AE_BIAS,
++	FTHD_FW_ROUNDTRIP_AE_METERING_MODE,
++	FTHD_FW_ROUNDTRIP_AE_INTEGRATION_TIME_MAX,
++	FTHD_FW_ROUNDTRIP_AE_GAIN_CAP,
++	FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN,
++};
+ 
+ /*
+  * These files are deliberately unlike the ring-state diagnostics above.
+@@ -451,6 +458,271 @@ FTHD_FW_READBACK_SHOW(seq_crop_raw_read, FTHD_FW_CROP);
+ 
+ #undef FTHD_FW_READBACK_SHOW
+ 
++static int fthd_firmware_roundtrip(struct fthd_private *dev_priv,
++				   enum fthd_fw_roundtrip roundtrip)
++{
++	u32 before, after, tag_before, tag_after;
++	u16 bias_before, bias_after;
++	u8 mode_before, mode_after;
++	int ret;
++
++	switch (roundtrip) {
++	case FTHD_FW_ROUNDTRIP_AE_BIAS:
++		ret = fthd_isp_cmd_channel_ae_bias_get(dev_priv, 0,
++						       &bias_before, &tag_before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_bias_set_raw(dev_priv, 0,
++							   bias_before, tag_before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_bias_get(dev_priv, 0,
++						       &bias_after, &tag_after);
++		if (ret)
++			return ret;
++		return bias_before == bias_after && tag_before == tag_after ?
++			0 : -EIO;
++	case FTHD_FW_ROUNDTRIP_AE_METERING_MODE:
++		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
++							       &mode_before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0,
++							       mode_before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
++							       &mode_after);
++		if (ret)
++			return ret;
++		return mode_before == mode_after ? 0 : -EIO;
++	case FTHD_FW_ROUNDTRIP_AE_INTEGRATION_TIME_MAX:
++		ret = fthd_isp_cmd_channel_ae_integration_time_max_get(dev_priv,
++								      0, &before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_integration_time_max_set_raw(
++			dev_priv, 0, before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_integration_time_max_get(dev_priv,
++								      0, &after);
++		if (ret)
++			return ret;
++		return before == after ? 0 : -EIO;
++	case FTHD_FW_ROUNDTRIP_AE_GAIN_CAP:
++		ret = fthd_isp_cmd_channel_ae_gain_cap_get(dev_priv, 0, &before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_gain_cap_set_raw(dev_priv, 0,
++							      before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_gain_cap_get(dev_priv, 0, &after);
++		if (ret)
++			return ret;
++		return before == after ? 0 : -EIO;
++	case FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN:
++		ret = fthd_isp_cmd_channel_ae_gain_cap_min_get(dev_priv, 0,
++							     &before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(dev_priv, 0,
++								  before);
++		if (ret)
++			return ret;
++		ret = fthd_isp_cmd_channel_ae_gain_cap_min_get(dev_priv, 0,
++							     &after);
++		if (ret)
++			return ret;
++		return before == after ? 0 : -EIO;
++	default:
++		return -EINVAL;
++	}
++}
++
++static ssize_t fthd_firmware_roundtrip_write(
++	struct file *file, const char __user *user_buf, size_t count,
++	loff_t *ppos, enum fthd_fw_roundtrip roundtrip)
++{
++	struct fthd_private *dev_priv = file->private_data;
++	char buf[16];
++	int ret;
++
++	if (!count)
++		return 0;
++	if (*ppos || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	if (strcmp(strim(buf), "same"))
++		return -EINVAL;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++	if (READ_ONCE(dev_priv->removing)) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (!dev_priv->channel_running) {
++		ret = -EPIPE;
++		goto out_unlock;
++	}
++
++	ret = fthd_pm_get(dev_priv);
++	if (ret)
++		goto out_unlock;
++	ret = fthd_firmware_roundtrip(dev_priv, roundtrip);
++	fthd_pm_put(dev_priv);
++out_unlock:
++	mutex_unlock(&dev_priv->ioctl_lock);
++	if (ret)
++		return ret;
++	*ppos += count;
++	return count;
++}
++
++#define FTHD_FW_ROUNDTRIP_FOPS(_name, _roundtrip)                         \
++	static ssize_t _name##_write(struct file *file,                    \
++				     const char __user *user_buf,          \
++				     size_t count, loff_t *ppos)           \
++	{                                                                    \
++		return fthd_firmware_roundtrip_write(file, user_buf, count,   \
++						     ppos, _roundtrip);       \
++	}                                                                    \
++	static const struct file_operations _name##_fops = {                 \
++		.owner = THIS_MODULE,                                           \
++		.open = fthd_debugfs_open,                                      \
++		.write = _name##_write,                                         \
++		.release = fthd_debugfs_release,                                \
++		.llseek = noop_llseek,                                          \
++	}
++
++FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_bias, FTHD_FW_ROUNDTRIP_AE_BIAS);
++FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_metering_mode,
++			      FTHD_FW_ROUNDTRIP_AE_METERING_MODE);
++FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_integration_time_max,
++			      FTHD_FW_ROUNDTRIP_AE_INTEGRATION_TIME_MAX);
++FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_gain_cap,
++			      FTHD_FW_ROUNDTRIP_AE_GAIN_CAP);
++FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_gain_cap_min,
++			      FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN);
++
++#undef FTHD_FW_ROUNDTRIP_FOPS
++
++/*
++ * A deliberately narrow mutation endpoint for identifying the four recovered
++ * Apple AE metering modes.  Numeric input is not accepted: spelling out the
++ * four compile-time tokens keeps this from becoming an arbitrary firmware
++ * setter while their user-visible meanings are still under test.
++ */
++static int fthd_metering_test_mode(char *token, u8 *mode)
++{
++	if (!strcmp(token, "mode0"))
++		*mode = 0;
++	else if (!strcmp(token, "mode1"))
++		*mode = 1;
++	else if (!strcmp(token, "mode2"))
++		*mode = 2;
++	else if (!strcmp(token, "mode3"))
++		*mode = 3;
++	else
++		return -EINVAL;
++
++	return 0;
++}
++
++static ssize_t fthd_test_ae_metering_mode_write(
++	struct file *file, const char __user *user_buf, size_t count, loff_t *ppos,
++	bool restart_ae)
++{
++	struct fthd_private *dev_priv = file->private_data;
++	char buf[16];
++	u8 requested, readback;
++	int ret, restart_ret;
++
++	if (!count)
++		return 0;
++	if (*ppos || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	ret = fthd_metering_test_mode(strim(buf), &requested);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++	if (READ_ONCE(dev_priv->removing)) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (!dev_priv->channel_running) {
++		ret = -EPIPE;
++		goto out_unlock;
++	}
++
++	ret = fthd_pm_get(dev_priv);
++	if (ret)
++		goto out_unlock;
++	if (restart_ae) {
++		ret = fthd_isp_cmd_channel_ae(dev_priv, 0, 0);
++		if (ret)
++			goto out_pm;
++	}
++	ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0,
++							 requested);
++	/* Once AE was stopped, always try to start it again even if SET failed. */
++	if (restart_ae) {
++		restart_ret = fthd_isp_cmd_channel_ae(dev_priv, 0, 1);
++		if (!ret)
++			ret = restart_ret;
++	}
++	if (!ret)
++		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
++							 &readback);
++	if (!ret && readback != requested)
++		ret = -EIO;
++out_pm:
++	fthd_pm_put(dev_priv);
++out_unlock:
++	mutex_unlock(&dev_priv->ioctl_lock);
++	if (ret)
++		return ret;
++	*ppos += count;
++	return count;
++}
++
++static ssize_t test_ae_metering_mode_write(
++	struct file *file, const char __user *user_buf, size_t count, loff_t *ppos)
++{
++	return fthd_test_ae_metering_mode_write(file, user_buf, count, ppos,
++						 false);
++}
++
++static ssize_t test_ae_metering_mode_restart_write(
++	struct file *file, const char __user *user_buf, size_t count, loff_t *ppos)
++{
++	return fthd_test_ae_metering_mode_write(file, user_buf, count, ppos,
++						 true);
++}
++
++static const struct file_operations test_ae_metering_mode_fops = {
++	.owner = THIS_MODULE,
++	.open = fthd_debugfs_open,
++	.write = test_ae_metering_mode_write,
++	.release = fthd_debugfs_release,
++	.llseek = noop_llseek,
++};
++
++static const struct file_operations test_ae_metering_mode_restart_fops = {
++	.owner = THIS_MODULE,
++	.open = fthd_debugfs_open,
++	.write = test_ae_metering_mode_restart_write,
++	.release = fthd_debugfs_release,
++	.llseek = noop_llseek,
++};
++
+ static int fthd_debugfs_seq_open(struct inode *inode, struct file *file,
+ 				 int (*show)(struct seq_file *, void *))
+ {
+@@ -597,6 +869,20 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
+ 			    &seq_awb_2nd_gain_raw_read_fops);
+ 	debugfs_create_file("crop_raw", 0400, d, dev_priv,
+ 			    &seq_crop_raw_read_fops);
++	debugfs_create_file("roundtrip_ae_bias", 0200, d, dev_priv,
++			    &roundtrip_ae_bias_fops);
++	debugfs_create_file("roundtrip_ae_metering_mode", 0200, d, dev_priv,
++			    &roundtrip_ae_metering_mode_fops);
++	debugfs_create_file("roundtrip_ae_integration_time_max", 0200, d,
++			    dev_priv, &roundtrip_ae_integration_time_max_fops);
++	debugfs_create_file("roundtrip_ae_gain_cap", 0200, d, dev_priv,
++			    &roundtrip_ae_gain_cap_fops);
++	debugfs_create_file("roundtrip_ae_gain_cap_min", 0200, d, dev_priv,
++			    &roundtrip_ae_gain_cap_min_fops);
++	debugfs_create_file("test_ae_metering_mode", 0200, d, dev_priv,
++			    &test_ae_metering_mode_fops);
++	debugfs_create_file("test_ae_metering_mode_restart", 0200, d, dev_priv,
++			    &test_ae_metering_mode_restart_fops);
+ 	debugfs_create_file("debug", 0600, d, dev_priv, &fops_debug);
+ 	dev_priv->debugfs = d;
+ 	fthd_debugfs_users++;
+diff --git a/fthd_isp.c b/fthd_isp.c
+index 93b388b..d8a14a6 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -1427,6 +1427,166 @@ int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
+ 	return 0;
+ }
+ 
++static int fthd_isp_cmd_channel_u32_set(struct fthd_private *dev_priv,
++					enum fthd_isp_cmds opcode, int channel,
++					u32 value)
++{
++	struct isp_cmd_channel_u32 cmd;
++	int len;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.value = value;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, opcode, &cmd, sizeof(cmd), &len);
++}
++
++int fthd_isp_cmd_channel_ae_gain_cap_set_raw(struct fthd_private *dev_priv,
++					      int channel, u32 value)
++{
++	return fthd_isp_cmd_channel_u32_set(dev_priv,
++					    CISP_CMD_CH_AE_GAIN_CAP_SET,
++					    channel, value);
++}
++
++int fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(struct fthd_private *dev_priv,
++						  int channel, u32 value)
++{
++	return fthd_isp_cmd_channel_u32_set(dev_priv,
++					    CISP_CMD_CH_AE_GAIN_CAP_MIN_SET,
++					    channel, value);
++}
++
++int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(
++	struct fthd_private *dev_priv, int channel, u32 value)
++{
++	return fthd_isp_cmd_channel_u32_set(dev_priv,
++			CISP_CMD_CH_AE_INTEGRATION_TIME_MAX_SET,
++			channel, value);
++}
++
++int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel,
++						 unsigned int usec)
++{
++	struct isp_cmd_channel_ae_integration_time_set cmd;
++	int len;
++
++	pr_debug("set integration time raw %u\n", usec);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.time = usec;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_INTEGRATION_TIME_SET, &cmd, sizeof(cmd), &len);
++}
++
++/* Not exposed: using two AE caps as a manual-gain control is unvalidated. */
++int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel,
++				     unsigned int gain)
++{
++	int ret;
++
++	pr_debug("set gain %u\n", gain);
++
++	ret = fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(dev_priv, channel,
++							    gain);
++	if (ret)
++		return ret;
++
++	return fthd_isp_cmd_channel_ae_gain_cap_set_raw(dev_priv, channel,
++							gain);
++}
++
++int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel,
++					unsigned int cct)
++{
++	struct isp_cmd_channel_awb_cct_manual cmd;
++	int len;
++
++	pr_debug("set awb cct raw %u\n", cct);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.cct = cct;
++	cmd.tag = 0;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_CCT_MANUAL, &cmd, sizeof(cmd), &len);
++}
++
++int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness)
++{
++	struct isp_cmd_channel_sharpness_set cmd;
++	int len;
++
++	pr_debug("set sharpness %d\n", sharpness);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.sharpness = sharpness;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SHARPNESS_SET, &cmd, sizeof(cmd), &len);
++}
++
++int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern)
++{
++	struct isp_cmd_channel_test_pattern_config cmd;
++	int len;
++
++	pr_debug("set test pattern %d\n", pattern);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.pattern = pattern;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEST_PATTERN_CONFIG, &cmd, sizeof(cmd), &len);
++}
++
++int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength)
++{
++	struct isp_cmd_channel_noise_reduction_set cmd;
++	int len;
++
++	pr_debug("set noise reduction %d\n", strength);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.strength = strength;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_NOISE_REDUCTION_SET, &cmd, sizeof(cmd), &len);
++}
++
++int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength)
++{
++	struct isp_cmd_channel_chroma_suppression_set cmd;
++	int len;
++
++	pr_debug("set chroma suppression %d\n", strength);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.field0 = strength;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CHROMA_SUPPRESSION_SET, &cmd, sizeof(cmd), &len);
++}
++
++/*
++ * DRC strength.  fthd_start_channel() issues CISP_CMD_CH_DRC_START, which turns
++ * the block on; this is the separate opcode that says how hard it works.
++ */
++int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength)
++{
++	struct isp_cmd_channel_drc_set cmd;
++	int len;
++
++	pr_debug("set drc strength %d\n", strength);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.strength = strength;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_DRC_SET, &cmd, sizeof(cmd), &len);
++}
++
+ /*
+  * Sensor die temperature, returned exactly as the firmware reports it.
+  *
+diff --git a/fthd_isp.h b/fthd_isp.h
+index 66043af..3ccf9b9 100644
+--- a/fthd_isp.h
++++ b/fthd_isp.h
+@@ -747,6 +747,55 @@ struct isp_cmd_channel_ae_metering_mode_get {
+ 	u8 reserved[3];
+ };
+ 
++/* Manual sensor integration time. The wire width is proven; units are not. */
++struct isp_cmd_channel_ae_integration_time_set {
++	u32 channel;
++	u32 time;
++};
++
++/* Firmware consumes both words after the channel. The first appears to be CCT
++ * and the second is likely a tag, but neither semantic is yet an ABI. */
++struct isp_cmd_channel_awb_cct_manual {
++	u32 channel;
++	u32 cct;
++	u32 tag;
++};
++
++struct isp_cmd_channel_sharpness_set {
++	u32 channel;
++	u8 sharpness;
++	u8 reserved[3];
++};
++
++struct isp_cmd_channel_test_pattern_config {
++	u32 channel;
++	u16 unknown;
++	u16 pattern;
++};
++
++/* Spatial noise-reduction byte. */
++struct isp_cmd_channel_noise_reduction_set {
++	u32 channel;
++	u8 strength;
++	u8 reserved[3];
++};
++
++/* Firmware consumes three distinct bytes. Their meanings are unknown, so this
++ * structure must not be exposed as one generic strength control. */
++struct isp_cmd_channel_chroma_suppression_set {
++	u32 channel;
++	u8 field0;
++	u8 field1;
++	u8 field2;
++};
++
++/* Dynamic-range-compression byte. */
++struct isp_cmd_channel_drc_set {
++	u32 channel;
++	u8 strength;
++	u8 reserved[3];
++};
++
+ /* Sensor die temperature.  A GET: @temperature is written by the firmware.
+  * The scale is not documented; see fthd_isp_cmd_channel_sensor_temperature()
+  * for how the driver avoids having to guess one. */
+@@ -862,17 +911,28 @@ extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int c
+ extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
+ extern int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel, u16 *bias, u32 *tag);
+ extern int fthd_isp_cmd_channel_ae_gain_cap_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_gain_cap_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
+ extern int fthd_isp_cmd_channel_ae_gain_cap_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
+ extern int fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get(struct fthd_private *dev_priv, int channel, u32 *value);
+ extern int fthd_isp_cmd_channel_ae_gain_cap_off_get(struct fthd_private *dev_priv, int channel, u32 *value);
+ extern int fthd_isp_cmd_channel_ae_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
+ extern int fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
+ extern int fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel, unsigned int usec);
++extern int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel, unsigned int gain);
+ extern int fthd_isp_cmd_channel_awb_cct_get(struct fthd_private *dev_priv, int channel, u32 *value);
+ extern int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv, int channel, u32 gain[3]);
+ extern int fthd_isp_cmd_channel_ae_frame_rate_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
+ extern int fthd_isp_cmd_channel_ae_frame_rate_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
+ extern int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel, u32 rect1[4], u32 rect2[4]);
++extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel, unsigned int cct);
++extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
++extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);
++extern int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength);
++extern int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength);
++extern int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength);
+ extern int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw);
+ extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
+ extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);

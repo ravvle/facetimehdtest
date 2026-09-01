@@ -1,0 +1,188 @@
+From 5eda5d6dc4dd2c62fef276edeb53daf876c0b985 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 18/19] v4l2: report the ISP colour-temperature estimate
+ read-only
+
+FTHD_CID_AWB_CCT_ESTIMATE (V4L2_CID_USER_BASE | 0x1003, printed by
+v4l-utils as awb_cct_estimate) reports the ISP's own current
+colour-temperature estimate from CISP_CMD_CH_AWB_CCT_GET. It is the one
+firmware value recovered during the lockup investigation that reaches the
+ordinary V4L2 surface, and three things justify that.
+
+Why it is safe to register. The rule the removed controls broke is that
+v4l2_ctrl_handler_setup() replays every registered control's default at each
+STREAMON. This control is V4L2_CTRL_FLAG_READ_ONLY, and handler_setup()
+skips read-only controls outright - so registering it adds a GET an
+application may ask for and no SET the framework can ever replay. That is a
+structural guarantee rather than a convention.
+
+Why the unit is not a guess. Under warm light this firmware reports around
+2652 and under cool light 5777, with the right ordering and realistic
+magnitudes; the value tracks lighting and not exposure. Cross-model
+confirmation is still open, which is part of why it is a private CID.
+
+Why not V4L2_CID_WHITE_BALANCE_TEMPERATURE. That control means the
+temperature an application asks the camera to *assume*: writable, paired
+with a manual AWB mode. This is a measurement the ISP produces, and the
+manual AWB-CCT setter carries a second payload word whose meaning is
+unidentified, so there is nothing to write. Publishing a measurement under a
+CID that means a set point would make an application that wrote it silently
+get nothing. 0x1001 and 0x1002 are deliberately skipped: they belonged to
+the removed noise-reduction and chroma-suppression controls.
+
+The control is volatile, so g_volatile_ctrl issues the GET on demand under a
+runtime-PM reference. It does not take ioctl_lock, because vdev->lock *is*
+ioctl_lock and video_ioctl2() already holds it - which is also what
+serialises it against the debugfs readbacks. On an idle camera it reports
+the last value sampled while streaming rather than failing or powering the
+ISP up: a diagnostic read is not a reason to retrain DDR and re-upload
+firmware, and returning an error there would fail v4l2-compliance for no
+gain.
+---
+ fthd_v4l2.c | 108 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 101 insertions(+), 7 deletions(-)
+
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 69cba17..45b463b 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -30,6 +30,37 @@
+ #define FTHD_MIN_HEIGHT 240
+ #define FTHD_PROTOCOL_ERROR_LIMIT 4
+ 
++/*
++ * The ISP's current correlated-colour-temperature estimate, read straight out
++ * of CISP_CMD_CH_AWB_CCT_GET.
++ *
++ * It is a driver-private CID rather than V4L2_CID_WHITE_BALANCE_TEMPERATURE
++ * because that standard control means the temperature the *application* asks
++ * the camera to assume, and is expected to be writable and paired with a manual
++ * AWB mode.  This is the opposite: a measurement the ISP produces, with no way
++ * to write it - the manual AWB-CCT setter carries a second payload word whose
++ * meaning is still unidentified, so it stays unexposed.  Publishing a
++ * measurement under a CID that means a set point would make an application that
++ * wrote it silently get nothing.
++ *
++ * The kelvin unit is hardware evidence rather than a guess - under warm light
++ * this firmware reported 2652 and under cool light 5777, with the right
++ * ordering and realistic magnitudes - but it is one machine, so
++ * FIRMWARE-REVERSE-ENGINEERING.md still lists cross-model confirmation as open.
++ * A private CID is also what keeps that caveat honest: nothing in userspace has
++ * a standing expectation about what this control means.
++ *
++ * 0x1001 and 0x1002 were used by the removed noise-reduction and
++ * chroma-suppression controls.  Starting at 0x1003 keeps anything built against
++ * that short-lived series from binding to a control with different semantics.
++ */
++#define FTHD_CID_AWB_CCT_ESTIMATE (V4L2_CID_USER_BASE | 0x1003)
++
++/* Wide enough for any plausible illuminant without asserting a tighter range
++ * than one machine's readings support. */
++#define FTHD_AWB_CCT_MIN 0
++#define FTHD_AWB_CCT_MAX 65535
++
+ /*
+  * The ISP's semi-planar output, format code 0, is NV12 - and hardware said so.
+  *
+@@ -1522,12 +1553,6 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
+ 	.vidioc_log_status      = v4l2_ctrl_log_status,
+ };
+ 
+-static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+-{
+-	pr_debug("id = %x\n", ctrl->id);
+-	return -EINVAL;
+-}
+-
+ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct fthd_private *dev_priv = container_of(ctrl->handler, struct fthd_private, v4l2_ctrl_handler);
+@@ -1576,10 +1601,75 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	return ret;
+ }
+ 
++/*
++ * Only FTHD_CID_AWB_CCT_ESTIMATE is volatile; every other control is answered
++ * by the framework from its own cached value and never reaches this.
++ *
++ * No ioctl_lock here.  The control handler hangs off vdev->ctrl_handler and
++ * vdev->lock *is* ioctl_lock, so video_ioctl2() has already taken it by the
++ * time either control op runs - taking it again would deadlock.  That is also
++ * what serialises this against the debugfs readbacks, which take it explicitly.
++ */
++static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct fthd_private *dev_priv = container_of(ctrl->handler,
++						     struct fthd_private,
++						     v4l2_ctrl_handler);
++	u32 cct;
++	int ret;
++
++	if (ctrl->id != FTHD_CID_AWB_CCT_ESTIMATE)
++		return -EINVAL;
++
++	/*
++	 * Nothing to read from an idle ISP, and this must not be the thing that
++	 * powers one up: the read is a diagnostic, not a reason to train DDR and
++	 * re-upload firmware.  Leaving ctrl->val alone reports the last value
++	 * sampled while streaming - zero if there has never been one - which is
++	 * what keeps G_CTRL succeeding for v4l2-compliance and for any
++	 * application that reads controls before STREAMON.
++	 */
++	if (!dev_priv->channel_running)
++		return 0;
++
++	ret = fthd_pm_get(dev_priv);
++	if (ret)
++		return ret;
++	ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &cct);
++	fthd_pm_put(dev_priv);
++	if (ret)
++		return ret;
++
++	/* The firmware field is a u32 and the observed range is a few thousand;
++	 * clamping keeps a nonsensical reading inside the advertised range
++	 * rather than letting it surface as a negative kelvin. */
++	ctrl->val = clamp_t(u32, cct, FTHD_AWB_CCT_MIN, FTHD_AWB_CCT_MAX);
++	return 0;
++}
++
+ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
+-	.g_volatile_ctrl = fthd_g_volatile_ctrl,
+ 	.s_ctrl = fthd_s_ctrl,
++	.g_volatile_ctrl = fthd_g_volatile_ctrl,
+ };
++
++/*
++ * Read-only, so v4l2_ctrl_handler_setup() skips it and no firmware SET is ever
++ * replayed at STREAMON or after a runtime resume.  That is the structural
++ * reason this control is safe to register while the manual AWB setter, whose
++ * second payload word is still unidentified, is not.
++ */
++static const struct v4l2_ctrl_config fthd_ctrl_awb_cct_estimate = {
++	.ops	= &fthd_ctrl_ops,
++	.id	= FTHD_CID_AWB_CCT_ESTIMATE,
++	.name	= "AWB CCT Estimate",
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.min	= FTHD_AWB_CCT_MIN,
++	.max	= FTHD_AWB_CCT_MAX,
++	.step	= 1,
++	.def	= FTHD_AWB_CCT_MIN,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
++};
++
+ static void fthd_video_device_release(struct video_device *vdev)
+ {
+ 	struct fthd_private *dev_priv = video_get_drvdata(vdev);
+@@ -1663,6 +1753,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
+ 			       V4L2_EXPOSURE_MANUAL, 0,
+ 			       V4L2_EXPOSURE_AUTO);
++	/* Read-only: registering it adds a GET the application can ask for and
++	 * no SET the framework can replay. */
++	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,
++			     &fthd_ctrl_awb_cct_estimate, NULL);
+ 
+ 	if (dev_priv->v4l2_ctrl_handler.error) {
+ 		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");

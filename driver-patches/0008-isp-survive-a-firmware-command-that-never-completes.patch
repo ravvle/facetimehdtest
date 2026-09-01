@@ -1,0 +1,445 @@
+From 8c5f9dcff9eec70b0694f6fadd9de5b6676681bb Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 08/19] isp: survive a firmware command that never completes
+
+Two problems, both reachable from ordinary use.
+
+A command that timed out freed its request object immediately. Firmware that
+is merely slow, not dead, may still write the completion afterwards - into
+memory the allocator has by then handed to someone else. On a timeout the
+object is now deliberately leaked onto dev_priv->mem_objects, which keeps
+its offset reserved, and reclaimed in bulk by isp_mem_destroy_all() the next
+time the ISP is torn down. The device is marked wedged so every further
+command fails with -EIO in a few instructions instead of piling up more
+two-second timeouts, and fthd_pm_down() clears the flag once the hardware
+and every outstanding object are gone.
+
+The ring waits were interruptible. A submitted command cannot be cancelled,
+so a signal that interrupted the completion wait left STREAMOFF releasing
+VB2 and IOMMU mappings that firmware still owned - visible as a failed
+channel stop, unknown buffer tags, and DMA writes to unmapped address zero
+when a capturing application was killed. The waits stay bounded but become
+uninterruptible, and the completion paths use wake_up() rather than
+wake_up_interruptible(), which cannot wake an uninterruptible waiter.
+
+fthd_mark_firmware_wedged() also errors the VB2 queue, so a reader blocked
+in DQBUF or poll() is woken with an error rather than left hanging. It is
+used by the three places that discover a dead device: the command timeout, a
+stuck interrupt (which now masks the interrupt properly instead of calling
+free_irq() from the work item it runs in), and PCI AER/DPC error recovery,
+which gets an err_handler for exactly that purpose.
+
+fthd_isp_cmd() and fthd_isp_debug_cmd() were near-identical copies of one
+another; they become thin wrappers over a shared body, differing only in
+channel, timeout and the two behaviours the debug channel actually has.
+---
+ fthd_drv.c     |  48 ++++++++++++-
+ fthd_drv.h     |   6 ++
+ fthd_isp.c     | 187 ++++++++++++++++++++++++++-----------------------
+ fthd_ringbuf.c |  14 +++-
+ 4 files changed, 163 insertions(+), 92 deletions(-)
+
+diff --git a/fthd_drv.c b/fthd_drv.c
+index 207dc8e..85a40d9 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -58,6 +58,13 @@ void fthd_put(struct fthd_private *dev_priv)
+ 	kref_put(&dev_priv->ref, fthd_release);
+ }
+ 
++void fthd_mark_firmware_wedged(struct fthd_private *dev_priv)
++{
++	WRITE_ONCE(dev_priv->wedged, true);
++	if (READ_ONCE(dev_priv->v4l2_registered))
++		vb2_queue_error(&dev_priv->vb2_queue);
++}
++
+ static void fthd_pci_release_mem(struct fthd_private *dev_priv)
+ {
+ 	if (dev_priv->s2_io) {
+@@ -235,19 +242,19 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
+ 
+ 	if (chan == dev_priv->channel_io) {
+ 		pr_debug("IO channel ready\n");
+-		wake_up_interruptible(&chan->wq);
++		wake_up(&chan->wq);
+ 		return;
+ 	}
+ 
+ 	if (chan == dev_priv->channel_buf_h2t) {
+ 		pr_debug("H2T channel ready\n");
+-		wake_up_interruptible(&chan->wq);
++		wake_up(&chan->wq);
+ 		return;
+ 	}
+ 
+ 	if (chan == dev_priv->channel_debug) {
+ 		pr_debug("DEBUG channel ready\n");
+-		wake_up_interruptible(&chan->wq);
++		wake_up(&chan->wq);
+ 		return;
+ 	}
+ 
+@@ -318,6 +325,7 @@ static void fthd_irq_work(struct work_struct *work)
+ 		dev_err(&dev_priv->pdev->dev, "irq stuck, disabling\n");
+ 		FTHD_ISP_REG_WRITE(0, ISP_IRQ_ENABLE);
+ 		pci_write_config_dword(dev_priv->pdev, 0x94, 0);
++		fthd_mark_firmware_wedged(dev_priv);
+ 		return;
+ 	}
+ 	pci_write_config_dword(dev_priv->pdev, 0x94, 0x200);
+@@ -530,6 +538,10 @@ static void fthd_pm_down(struct fthd_private *dev_priv)
+ 	fthd_pci_release_mem(dev_priv);
+ 	pci_disable_device(pdev);
+ 	dev_priv->suspended = true;
++	/* isp_uninit() above just reclaimed every object a timed-out command
++	 * left unfreed; the next fthd_pm_up() reloads the firmware from
++	 * scratch, so any earlier wedge no longer applies. */
++	WRITE_ONCE(dev_priv->wedged, false);
+ }
+ 
+ /*
+@@ -731,6 +743,35 @@ static const struct dev_pm_ops fthd_pm_ops = {
+ };
+ #endif /* CONFIG_PM */
+ 
++/*
++ * AER/DPC: the PCI core has already decided the link is unusable.  There is
++ * no channel_io left to send a graceful CISP_CMD_STOP down, and no BAR left
++ * worth touching, so this does not attempt fthd_pm_down()'s normal hardware
++ * transition - only wakes up whatever is blocked waiting on the device.
++ * Without this, a reader blocked in DQBUF or v4l2-compliance's poll() would
++ * hang until the process is killed instead of getting -EIO back.
++ */
++static pci_ers_result_t fthd_pci_error_detected(struct pci_dev *pdev,
++						pci_channel_state_t state)
++{
++	struct fthd_private *dev_priv = pci_get_drvdata(pdev);
++
++	if (!dev_priv)
++		return PCI_ERS_RESULT_DISCONNECT;
++
++	dev_err(&pdev->dev, "PCI error detected (state %d), disconnecting\n", state);
++
++	mutex_lock(&dev_priv->ioctl_lock);
++	fthd_mark_firmware_wedged(dev_priv);
++	mutex_unlock(&dev_priv->ioctl_lock);
++
++	return PCI_ERS_RESULT_DISCONNECT;
++}
++
++static const struct pci_error_handlers fthd_pci_err_handler = {
++	.error_detected = fthd_pci_error_detected,
++};
++
+ static const struct pci_device_id fthd_pci_id_table[] = {
+ 	{ PCI_DEVICE(0x14e4, 0x1570) },
+ 	{ 0, },
+@@ -741,6 +782,7 @@ static struct pci_driver fthd_pci_driver = {
+ 	.probe = fthd_pci_probe,
+ 	.remove = fthd_pci_remove,
+ 	.id_table = fthd_pci_id_table,
++	.err_handler = &fthd_pci_err_handler,
+ #ifdef CONFIG_PM
+ 	.driver.pm = &fthd_pm_ops,
+ #endif
+diff --git a/fthd_drv.h b/fthd_drv.h
+index f68d65d..39d98be 100644
+--- a/fthd_drv.h
++++ b/fthd_drv.h
+@@ -138,11 +138,17 @@ struct fthd_private {
+ 	 * runtime-PM core to force the hardware down, so runtime suspend must not
+ 	 * reject that particular transition merely because vb2 is still busy. */
+ 	bool system_suspending;
++	/* Set when firmware stops answering or violates the streaming protocol,
++	 * so commands fail fast and VB2 waiters wake with an error. Cleared in
++	 * fthd_pm_down(), whose teardown reclaims whatever the wedge left
++	 * unfreed; the next open() reloads firmware via fthd_pm_up(). */
++	bool wedged;
+ 	struct dentry *debugfs;
+ };
+ 
+ bool fthd_get(struct fthd_private *dev_priv);
+ void fthd_put(struct fthd_private *dev_priv);
++void fthd_mark_firmware_wedged(struct fthd_private *dev_priv);
+ 
+ /* Bring the camera out of runtime suspend and hold it there.  Returns 0 with a
+  * reference held, or a negative error with none.  Not usable from atomic
+diff --git a/fthd_isp.c b/fthd_isp.c
+index b72b55b..0ba9a2a 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -368,8 +368,32 @@ out:
+ 	return ret;
+ }
+ 
+-static int fthd_isp_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds command, void *buf,
+-			int request_len, int *response_len)
++/*
++ * Shared body of fthd_isp_cmd() and fthd_isp_debug_cmd(). @chan and @timeout_ms
++ * are the only things that differ between the IO and debug channel variants,
++ * plus the debug channel never sends CISP_CMD_POWER_DOWN and logs its status
++ * line at a different level - both are gated on @is_debug.
++ *
++ * A command that never gets an answer - fthd_channel_wait_ready() timing out -
++ * means the firmware is not responding and may still complete this command
++ * later into memory nothing else has claimed. The request object is
++ * deliberately not freed in that case: it is left on dev_priv->mem_objects,
++ * which keeps the allocator from ever handing its offset to anyone else, and
++ * it is reclaimed in bulk by isp_mem_destroy_all() the next time
++ * fthd_pm_down() tears the ISP down. @dev_priv->wedged is set so every
++ * further command fails fast instead of piling up more multi-second
++ * timeouts; it is cleared in fthd_pm_down() once the hardware and every
++ * outstanding object are gone.
++ *
++ * Once a command is in the hardware ring it cannot be cancelled. Its bounded
++ * completion wait must therefore not be interruptible by a userspace signal:
++ * returning early from a channel STOP lets STREAMOFF release DMA mappings
++ * while firmware still owns them. The timeout remains the escape hatch for
++ * firmware that genuinely stops responding.
++ */
++static int __fthd_isp_cmd(struct fthd_private *dev_priv, struct fw_channel *chan,
++			  int timeout_ms, bool is_debug, enum fthd_isp_cmds command,
++			  void *buf, int request_len, int *response_len)
+ {
+ 	struct isp_mem_obj *request;
+ 	struct isp_cmd_hdr cmd;
+@@ -377,16 +401,24 @@ static int fthd_isp_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds comman
+ 	u32 entry;
+ 	int len, ret;
+ 
++	if (READ_ONCE(dev_priv->wedged))
++		return -EIO;
++
+ 	memset(&cmd, 0, sizeof(cmd));
++	if (request_len < 0 || (request_len && !buf) ||
++	    (response_len && (*response_len < 0 || (*response_len && !buf))))
++		return -EINVAL;
+ 
+ 	if (response_len) {
+ 		len = max(request_len, *response_len);
+ 	} else {
+ 		len = request_len;
+ 	}
++	if (len > INT_MAX - sizeof(struct isp_cmd_hdr))
++		return -EOVERFLOW;
+ 	len += sizeof(struct isp_cmd_hdr);
+ 
+-	pr_debug("sending cmd %d to firmware\n", command);
++	pr_debug("sending %scmd %d to firmware\n", is_debug ? "debug " : "", command);
+ 
+ 	request = isp_mem_create(dev_priv, FTHD_MEM_CMD, len);
+ 	if (!request) {
+@@ -396,120 +428,103 @@ static int fthd_isp_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds comman
+ 
+ 	cmd.opcode = command;
+ 
+-	FTHD_S2_MEMCPY_TOIO(request->offset, &cmd, sizeof(struct isp_cmd_hdr));
+-	if (request_len)
+-		FTHD_S2_MEMCPY_TOIO(request->offset + sizeof(struct isp_cmd_hdr), buf, request_len);
++	ret = FTHD_S2_MEMCPY_TOIO(request->offset, &cmd, sizeof(cmd));
++	if (ret)
++		goto out_free;
++	if (request_len) {
++		ret = FTHD_S2_MEMCPY_TOIO(request->offset + sizeof(cmd),
++					   buf, request_len);
++		if (ret)
++			goto out_free;
++	}
+ 
+-	ret = fthd_channel_ringbuf_send(dev_priv, dev_priv->channel_io,
+-					  request->offset, request_len + 8, (response_len ? *response_len : 0) + 8, &entry);
++	ret = fthd_channel_ringbuf_send(dev_priv, chan, request->offset,
++					  request_len + 8,
++					  (response_len ? *response_len : 0) + 8, &entry);
+ 	if (ret)
+-		goto out;
++		goto out_free;
+ 
+ 	if (entry == (u32)-1) {
+ 		ret = -EIO;
+-		goto out;
++		goto out_free;
+ 	}
+ 
+-	if (command == CISP_CMD_POWER_DOWN) {
++	if (!is_debug && command == CISP_CMD_POWER_DOWN) {
+ 		/* powerdown doesn't seem to generate a response */
+ 		ret = 0;
+-		goto out;
++		goto out_free;
+ 	}
+ 
+-        ret = fthd_channel_wait_ready(dev_priv, dev_priv->channel_io, entry, 2000);
++	ret = fthd_channel_wait_ready(dev_priv, chan, entry, timeout_ms);
+ 	if (ret) {
+ 		if (response_len)
+ 			*response_len = 0;
+-		goto out;
++		if (ret == -ETIMEDOUT) {
++			dev_err(&dev_priv->pdev->dev,
++				"%s: firmware stopped responding, disabling further commands\n",
++				chan->name);
++			fthd_mark_firmware_wedged(dev_priv);
++		}
++		/* Do not isp_mem_destroy(request): the firmware may still write a
++		 * late completion into it. Leaked into mem_objects until the next
++		 * full teardown reclaims it. */
++		return ret;
+ 	}
+ 
+-	FTHD_S2_MEMCPY_FROMIO(&cmd, request->offset, sizeof(struct isp_cmd_hdr));
++	ret = FTHD_S2_MEMCPY_FROMIO(&cmd, request->offset, sizeof(cmd));
++	if (ret)
++		goto out_free;
+ 	address = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS);
+ 	request_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_REQUEST_SIZE);
+ 	response_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_RESPONSE_SIZE);
+ 
+ 	/* XXX: response size in the ringbuf is zero after command completion, how is buffer size
+ 	        verification done? */
+-	if (response_len && *response_len)
+-		FTHD_S2_MEMCPY_FROMIO(buf, (address & ~3) + sizeof(struct isp_cmd_hdr),
+-				     *response_len);
++	if ((address & ~3) != request->offset) {
++		dev_err(&dev_priv->pdev->dev,
++			"Firmware returned %sbuffer at invalid address %#x\n",
++			is_debug ? "debug " : "command ", address & ~3);
++		ret = -EIO;
++		goto out_free;
++	}
+ 
+-	pr_debug("status %04x, request_len %d response len %d address_flags %x\n", cmd.status,
+-		request_size, response_size, address);
++	if (response_len && *response_len) {
++		if (*response_len > request->size - sizeof(cmd)) {
++			ret = -EOVERFLOW;
++			goto out_free;
++		}
++		ret = FTHD_S2_MEMCPY_FROMIO(buf, request->offset + sizeof(cmd),
++					     *response_len);
++		if (ret)
++			goto out_free;
++	}
+ 
+-	ret = cmd.status ? -EIO : 0;
+-out:
++	dev_dbg(&dev_priv->pdev->dev,
++		"status %04x, request_len %d response len %d address_flags %x\n",
++		cmd.status, request_size, response_size, address);
++	/* Debug-channel commands have always ignored cmd.status; upstream left
++	 * no reason why, and nothing here can retest it blind, so the
++	 * behaviour is preserved exactly. Only the log level changed: the two
++	 * branches printed the same line at different levels, which meant the
++	 * debug channel was the louder of the two. */
++	ret = is_debug ? 0 : (cmd.status ? -EIO : 0);
++out_free:
+ 	isp_mem_destroy(request);
+ 	return ret;
+ }
+ 
+-int fthd_isp_debug_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds command, void *buf,
++static int fthd_isp_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds command, void *buf,
+ 			int request_len, int *response_len)
+ {
+-	struct isp_mem_obj *request;
+-	struct isp_cmd_hdr cmd;
+-	u32 address, request_size, response_size;
+-	u32 entry;
+-	int len, ret;
+-
+-	memset(&cmd, 0, sizeof(cmd));
+-
+-	if (response_len) {
+-		len = max(request_len, *response_len);
+-	} else {
+-		len = request_len;
+-	}
+-	len += sizeof(struct isp_cmd_hdr);
+-
+-	pr_debug("sending debug cmd %d to firmware\n", command);
+-
+-	request = isp_mem_create(dev_priv, FTHD_MEM_CMD, len);
+-	if (!request) {
+-		dev_err(&dev_priv->pdev->dev, "failed to allocate cmd memory object\n");
+-		return -ENOMEM;
+-	}
+-
+-	cmd.opcode = command;
+-
+-	FTHD_S2_MEMCPY_TOIO(request->offset, &cmd, sizeof(struct isp_cmd_hdr));
+-	if (request_len)
+-		FTHD_S2_MEMCPY_TOIO(request->offset + sizeof(struct isp_cmd_hdr), buf, request_len);
+-
+-	ret = fthd_channel_ringbuf_send(dev_priv, dev_priv->channel_debug,
+-					  request->offset, request_len + 8, (response_len ? *response_len : 0) + 8, &entry);
+-	if (ret)
+-		goto out;
+-
+-	if (entry == (u32)-1) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-
+-        ret = fthd_channel_wait_ready(dev_priv, dev_priv->channel_debug, entry, 20000);
+-	if (ret) {
+-		if (response_len)
+-			*response_len = 0;
+-		goto out;
+-	}
+-
+-	FTHD_S2_MEMCPY_FROMIO(&cmd, request->offset, sizeof(struct isp_cmd_hdr));
+-	address = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS);
+-	request_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_REQUEST_SIZE);
+-	response_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_RESPONSE_SIZE);
+-
+-	/* XXX: response size in the ringbuf is zero after command completion, how is buffer size
+-	        verification done? */
+-	if (response_len && *response_len)
+-		FTHD_S2_MEMCPY_FROMIO(buf, (address & ~3) + sizeof(struct isp_cmd_hdr),
+-				     *response_len);
+-
+-	pr_info("status %04x, request_len %d response len %d address_flags %x\n", cmd.status,
+-		request_size, response_size, address);
++	return __fthd_isp_cmd(dev_priv, dev_priv->channel_io, 2000, false,
++			      command, buf, request_len, response_len);
++}
+ 
+-	ret = 0;
+-out:
+-	isp_mem_destroy(request);
+-	return ret;
++int fthd_isp_debug_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds command, void *buf,
++			int request_len, int *response_len)
++{
++	return __fthd_isp_cmd(dev_priv, dev_priv->channel_debug, 20000, true,
++			      command, buf, request_len, response_len);
+ }
+ 
+ 
+diff --git a/fthd_ringbuf.c b/fthd_ringbuf.c
+index dd183fb..4dd3e74 100644
+--- a/fthd_ringbuf.c
++++ b/fthd_ringbuf.c
+@@ -123,9 +123,17 @@ out:
+ 
+ int fthd_channel_wait_ready(struct fthd_private *dev_priv, struct fw_channel *chan, u32 entry, int timeout)
+ {
+-	if (wait_event_interruptible_timeout(chan->wq,
+-					     (FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^ (chan->type != 0),
+-		msecs_to_jiffies(timeout)) <= 0) {
++	long ret;
++
++	/* A ring submission cannot be cancelled. In particular, allowing SIGTERM
++	 * to abort a channel-STOP wait makes STREAMOFF release the buffers while
++	 * firmware may still DMA into them. Keep the wait bounded but
++	 * uninterruptible. The IRQ completion side must use wake_up(), not
++	 * wake_up_interruptible(), so it can wake this task immediately. */
++	ret = wait_event_timeout(chan->wq,
++			(FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^
++			(chan->type != 0), msecs_to_jiffies(timeout));
++	if (!ret) {
+ 		dev_err(&dev_priv->pdev->dev, "%s: timeout\n", chan->name);
+ 		fthd_channel_ringbuf_dump(dev_priv, chan);
+ 		return -ETIMEDOUT;

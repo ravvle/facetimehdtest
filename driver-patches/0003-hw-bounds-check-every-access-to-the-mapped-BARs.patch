@@ -1,0 +1,243 @@
+From 7d26aa6dbc67a376e3afe76c6d9b8c74bf43c48a Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 03/19] hw: bounds-check every access to the mapped BARs
+
+The register accessors already refused an offset past the end of a BAR, but
+they compared only the offset, not the offset plus the width of the access,
+and the two memcpy helpers checked nothing at all. Firmware supplies several
+of the addresses that reach them - the shared-malloc free address, the
+terminal buffer address, the channel descriptor table - so an out-of-range
+length is not hypothetical.
+
+Add fthd_range_valid(), which tests offset and length against the mapped
+size without overflowing, and route every accessor through it.
+FTHD_S2_MEMCPY_TOIO() and FTHD_S2_MEMCPY_FROMIO() now return an error
+instead of memcpy_toio()-ing past the mapping, and every caller checks it:
+the firmware image load, the ISP command request and response copies, the
+DMA descriptor submission, the shared-malloc header and the FWMSG text.
+
+fthd_ddr_verify_mem() gets the same treatment. It ignored its own @base
+argument and wrote at MEM_VERIFY_BASE regardless, and it never checked
+@count against the mapped window - an oversized request would have produced
+one dev_err per word. It now honours @base and clamps @count to what the S2
+memory BAR actually maps.
+---
+ fthd_ddr.c  | 27 ++++++++++++++++++++++++---
+ fthd_drv.c  |  3 ++-
+ fthd_hw.h   | 47 +++++++++++++++++++++++++++++++++++++----------
+ fthd_isp.c  |  5 ++++-
+ fthd_v4l2.c |  6 +++++-
+ 5 files changed, 72 insertions(+), 16 deletions(-)
+
+diff --git a/fthd_ddr.c b/fthd_ddr.c
+index df21537..dea183d 100644
+--- a/fthd_ddr.c
++++ b/fthd_ddr.c
+@@ -28,24 +28,45 @@
+ #include "fthd_hw.h"
+ #include "fthd_ddr.h"
+ 
++/*
++ * Write a pseudo-random pattern over @count words of ISP DRAM starting at
++ * @base, read it back, and return the OR of every bit that came back wrong
++ * (folded into 16 bits, one per data line).  Zero means the DDR link carried
++ * everything intact.
++ *
++ * @count is clamped to what the S2 memory BAR actually maps.  Each individual
++ * out-of-range access would otherwise log its own dev_err, so an oversized
++ * request degrades to "verify as much as exists" rather than a million lines
++ * of error spam.
++ */
+ int fthd_ddr_verify_mem(struct fthd_private *dev_priv, u32 base, int count)
+ {
+-	u32 i, val, val_read;
++	u32 i, val, val_read, max_words;
+ 	int failed_bits = 0;
+ 	struct rnd_state state;
+ 
++	if (count <= 0)
++		return 0;
++
++	if (dev_priv->s2_mem_len <= base)
++		return 0;
++
++	max_words = (dev_priv->s2_mem_len - base) / sizeof(u32);
++	if ((u32)count > max_words)
++		count = max_words;
++
+ 	prandom_seed_state(&state, 0x12345678);
+ 
+ 	for (i = 0; i < count; i++) {
+ 		val = prandom_u32_state(&state);
+-		FTHD_S2_MEM_WRITE(val, i * 4 + MEM_VERIFY_BASE);
++		FTHD_S2_MEM_WRITE(val, i * 4 + base);
+ 	}
+ 
+ 	prandom_seed_state(&state, 0x12345678);
+ 
+ 	for (i = 0; i < count; i++) {
+ 		val = prandom_u32_state(&state);
+-		val_read = FTHD_S2_MEM_READ(i * 4 + MEM_VERIFY_BASE);
++		val_read = FTHD_S2_MEM_READ(i * 4 + base);
+ 
+ 		failed_bits |= val ^ val_read;
+ 	}
+diff --git a/fthd_drv.c b/fthd_drv.c
+index 6a3ca86..4560b94 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -136,7 +136,8 @@ static void terminal_handler(struct fthd_private *dev_priv,
+ 
+ 	if (request_size > 512)
+ 		request_size = 512;
+-	FTHD_S2_MEMCPY_FROMIO(buf, address, request_size);
++	if (FTHD_S2_MEMCPY_FROMIO(buf, address, request_size))
++		return;
+ 	/* The firmware's own console. Interesting when debugging the ISP,
+ 	 * noise the rest of the time - and it arrives per firmware message,
+ 	 * so at dev_info it is the single largest contributor to the log
+diff --git a/fthd_hw.h b/fthd_hw.h
+index 58d8024..3adbc1f 100644
+--- a/fthd_hw.h
++++ b/fthd_hw.h
+@@ -12,6 +12,17 @@
+ 
+ #include <linux/pci.h>
+ 
++static inline bool fthd_range_valid(u32 offset, size_t len, u32 total)
++{
++	return offset <= total && len <= total - offset;
++}
++
++static inline bool fthd_s2_mem_range_valid(struct fthd_private *dev_priv,
++					    u32 offset, size_t len)
++{
++	return fthd_range_valid(offset, len, dev_priv->s2_mem_len);
++}
++
+ /* Used after most PCI Link IO writes */
+ static inline void fthd_hw_pci_post(struct fthd_private *dev_priv)
+ {
+@@ -31,7 +42,7 @@ static inline void fthd_hw_pci_post(struct fthd_private *dev_priv)
+ 
+ static inline u32 _FTHD_S2_REG_READ(struct fthd_private *dev_priv, u32 offset)
+ {
+-	if (offset >= dev_priv->s2_io_len) {
++	if (!fthd_range_valid(offset, sizeof(u32), dev_priv->s2_io_len)) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"S2 IO read out of range at %u\n", offset);
+ 		return 0;
+@@ -44,7 +55,7 @@ static inline u32 _FTHD_S2_REG_READ(struct fthd_private *dev_priv, u32 offset)
+ static inline void _FTHD_S2_REG_WRITE(struct fthd_private *dev_priv, u32 val,
+ 				      u32 offset)
+ {
+-	if (offset >= dev_priv->s2_io_len) {
++	if (!fthd_range_valid(offset, sizeof(u32), dev_priv->s2_io_len)) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"S2 IO write out of range at %u\n", offset);
+ 		return;
+@@ -57,7 +68,7 @@ static inline void _FTHD_S2_REG_WRITE(struct fthd_private *dev_priv, u32 val,
+ 
+ static inline u32 _FTHD_S2_MEM_READ(struct fthd_private *dev_priv, u32 offset)
+ {
+-	if (offset >= dev_priv->s2_mem_len) {
++	if (!fthd_s2_mem_range_valid(dev_priv, offset, sizeof(u32))) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"S2 MEM read out of range at %u\n", offset);
+ 		return 0;
+@@ -70,7 +81,7 @@ static inline u32 _FTHD_S2_MEM_READ(struct fthd_private *dev_priv, u32 offset)
+ static inline void _FTHD_S2_MEM_WRITE(struct fthd_private *dev_priv, u32 val,
+ 				      u32 offset)
+ {
+-	if (offset >= dev_priv->s2_mem_len) {
++	if (!fthd_s2_mem_range_valid(dev_priv, offset, sizeof(u32))) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"S2 MEM write out of range at %u\n", offset);
+ 		return;
+@@ -80,22 +91,38 @@ static inline void _FTHD_S2_MEM_WRITE(struct fthd_private *dev_priv, u32 val,
+ 	iowrite32(val, dev_priv->s2_mem + offset);
+ }
+ 
+-static inline void _FTHD_S2_MEMCPY_TOIO(struct fthd_private *dev_priv, const void *buf,
+-					u32 offset, int len)
++static inline int _FTHD_S2_MEMCPY_TOIO(struct fthd_private *dev_priv,
++				       const void *buf, u32 offset, size_t len)
+ {
++	if (!fthd_s2_mem_range_valid(dev_priv, offset, len)) {
++		dev_err(&dev_priv->pdev->dev,
++			"S2 MEM copy-to out of range at %u (length %zu)\n",
++			offset, len);
++		return -EINVAL;
++	}
++
+ 	memcpy_toio(dev_priv->s2_mem + offset, buf, len);
++	return 0;
+ }
+ 
+ 
+-static inline void _FTHD_S2_MEMCPY_FROMIO(struct fthd_private *dev_priv, void *buf,
+-					  u32 offset, int len)
++static inline int _FTHD_S2_MEMCPY_FROMIO(struct fthd_private *dev_priv,
++					 void *buf, u32 offset, size_t len)
+ {
++	if (!fthd_s2_mem_range_valid(dev_priv, offset, len)) {
++		dev_err(&dev_priv->pdev->dev,
++			"S2 MEM copy-from out of range at %u (length %zu)\n",
++			offset, len);
++		return -EINVAL;
++	}
++
+ 	memcpy_fromio(buf, dev_priv->s2_mem + offset, len);
++	return 0;
+ }
+ 
+ static inline u32 _FTHD_ISP_REG_READ(struct fthd_private *dev_priv, u32 offset)
+ {
+-	if (offset >= dev_priv->isp_io_len) {
++	if (!fthd_range_valid(offset, sizeof(u32), dev_priv->isp_io_len)) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"ISP IO read out of range at %u\n", offset);
+ 		return 0;
+@@ -108,7 +135,7 @@ static inline u32 _FTHD_ISP_REG_READ(struct fthd_private *dev_priv, u32 offset)
+ static inline void _FTHD_ISP_REG_WRITE(struct fthd_private *dev_priv, u32 val,
+ 				       u32 offset)
+ {
+-	if (offset >= dev_priv->isp_io_len) {
++	if (!fthd_range_valid(offset, sizeof(u32), dev_priv->isp_io_len)) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"ISP IO write out of range at %u\n", offset);
+ 		return;
+diff --git a/fthd_isp.c b/fthd_isp.c
+index d416d8b..2ffdbb3 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -1402,7 +1402,10 @@ int isp_init(struct fthd_private *dev_priv)
+ 		fw_args_data.fw_arg = 0;
+ 		fw_args_data.full_stats_mode = 0;
+ 
+-		FTHD_S2_MEMCPY_TOIO(fw_args->offset, &fw_args_data, sizeof(fw_args_data));
++		ret = FTHD_S2_MEMCPY_TOIO(fw_args->offset, &fw_args_data,
++					 sizeof(fw_args_data));
++		if (ret)
++			return ret;
+ 
+ 		FTHD_ISP_REG_WRITE(fw_args->offset, ISP_REG_C301C);
+ 
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 1ecbc56..690deb3 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -101,7 +101,11 @@ static int fthd_send_h2t_buffer(struct fthd_private *dev_priv, struct h2t_buf_ct
+ 	int ret;
+ 
+ 	pr_debug("sending buffer %p size %ld, ctx %p\n", ctx->vb, sizeof(ctx->dma_desc_list), ctx);
+-	FTHD_S2_MEMCPY_TOIO(ctx->dma_desc_obj->offset, &ctx->dma_desc_list, sizeof(ctx->dma_desc_list));
++	ret = FTHD_S2_MEMCPY_TOIO(ctx->dma_desc_obj->offset,
++				   &ctx->dma_desc_list,
++				   sizeof(ctx->dma_desc_list));
++	if (ret)
++		return ret;
+ 	ret = fthd_channel_ringbuf_send(dev_priv, dev_priv->channel_buf_h2t,
+ 					ctx->dma_desc_obj->offset, 0x180, 0x30000000, &entry);
+ 

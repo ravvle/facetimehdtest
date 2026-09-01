@@ -1,0 +1,849 @@
+From 78e7cf421c824db7dcfe71a0c53175651b20ead6 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 06/19] pci: symmetric bring-up and teardown, with runtime
+ power management
+
+Upstream's PM callbacks were fthd_pci_remove() and fthd_pci_probe(): a
+system suspend tore the driver down completely, including the V4L2 device,
+and a resume built a new one. Any file descriptor an application held across
+a suspend pointed at freed memory afterwards.
+
+Split the hardware transition out of probe/remove into a pair of functions
+that only ever touch hardware:
+
+  - fthd_pm_down() stops the firmware, releases the interrupt, the BARs and
+    the DMA buffers, and hands the device back to the PCI core for D3.
+  - fthd_pm_up() reverses it: powering the ISP off loses the DDR training
+    and the firmware image, so both are redone from scratch.
+
+dev_priv, the V4L2 registration and the debugfs tree survive across that, so
+/dev/videoN and every open fd outlive a power cycle. Both are idempotent and
+run under a new pm_lock; the runtime callbacks take only that lock, since a
+runtime resume is reached from open() with no V4L2 lock held.
+
+On top of that:
+
+  - Real dev_pm_ops, with runtime PM selected by facetimehd.runtime_pm=1.
+    An open video file holds a reference, the camera autosuspends five
+    seconds after the last close, and the next open reloads its firmware.
+    The module default leaves the device powered, so bare module discovery
+    never schedules an ISP/DDR/PCI teardown.
+  - dev_priv is refcounted. The video_device can outlive PCI unbind while an
+    fd is open, so it takes a reference and drops it from its release
+    callback; ->removing makes open() and the debugfs accessors fail with
+    -ENODEV once removal starts.
+  - The BARs are requested and released as a set, mapped with pci_iomap()
+    and unmapped in one place, and a failed mapping unwinds instead of
+    leaving three half-mapped BARs behind. isp_init() failing now runs
+    isp_uninit(), and isp_free_channel_info() clears the channel pointers it
+    frees rather than leaving them dangling.
+  - vdev->lock and the vb2 queue lock become ioctl_lock, so the ioctl,
+    control and debugfs paths serialise against each other, and
+    fthd_v4l2_register() unwinds each stage it got through.
+---
+ fthd_buffer.c |   1 +
+ fthd_drv.c    | 314 ++++++++++++++++++++++++++++++++++++++------------
+ fthd_drv.h    |  48 +++++++-
+ fthd_hw.c     |  11 +-
+ fthd_isp.c    |  19 +++
+ fthd_v4l2.c   | 110 +++++++++++++++---
+ 6 files changed, 405 insertions(+), 98 deletions(-)
+
+diff --git a/fthd_buffer.c b/fthd_buffer.c
+index 309c879..ce43f55 100644
+--- a/fthd_buffer.c
++++ b/fthd_buffer.c
+@@ -100,6 +100,7 @@ void iommu_free(struct fthd_private *dev_priv, struct iommu_obj *obj)
+ static void iommu_allocator_destroy(struct fthd_private *dev_priv)
+ {
+ 	kfree(dev_priv->iommu);
++	dev_priv->iommu = NULL;
+ }
+ 
+ int fthd_buffer_init(struct fthd_private *dev_priv)
+diff --git a/fthd_drv.c b/fthd_drv.c
+index 6e94dd0..6bdc817 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -13,6 +13,8 @@
+ #include <linux/version.h>
+ #include <linux/io.h>
+ #include <linux/interrupt.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
+ #include <linux/workqueue.h>
+ #include <linux/spinlock.h>
+ #include <linux/videodev2.h>
+@@ -24,50 +26,87 @@
+ #include "fthd_v4l2.h"
+ #include "fthd_debugfs.h"
+ 
+-static int fthd_pci_reserve_mem(struct fthd_private *dev_priv)
++/* Powering the ISP back up means re-training DDR and re-uploading the firmware
++ * image, which is not cheap.  Idle for this long before doing it. */
++#define FTHD_AUTOSUSPEND_DELAY_MS 5000
++#define FTHD_PCI_BAR_MASK (BIT(FTHD_PCI_S2_IO) | BIT(FTHD_PCI_S2_MEM) | \
++			   BIT(FTHD_PCI_ISP_IO))
++
++static bool runtime_pm;
++module_param(runtime_pm, bool, 0444);
++MODULE_PARM_DESC(runtime_pm,
++		 "Power the camera down while nothing has it open (default: 0). "
++		 "Enable only after validating suspend/resume on this machine.");
++
++static void fthd_pm_down(struct fthd_private *dev_priv);
++
++static void fthd_release(struct kref *ref)
+ {
+-	unsigned long start;
+-	unsigned long len;
+-	int ret;
++	struct fthd_private *dev_priv = container_of(ref, struct fthd_private,
++						     ref);
+ 
+-	/* Reserve resources */
+-	ret = pci_request_region(dev_priv->pdev, FTHD_PCI_S2_IO, "S2 IO");
+-	if (ret) {
+-		dev_err(&dev_priv->pdev->dev, "Failed to request S2 IO\n");
+-		return ret;
+-	}
++	kfree(dev_priv);
++}
+ 
+-	ret = pci_request_region(dev_priv->pdev, FTHD_PCI_ISP_IO, "ISP IO");
+-	if (ret) {
+-		dev_err(&dev_priv->pdev->dev, "Failed to request ISP IO\n");
+-		pci_release_region(dev_priv->pdev, FTHD_PCI_S2_IO);
+-		return ret;
++bool fthd_get(struct fthd_private *dev_priv)
++{
++	return kref_get_unless_zero(&dev_priv->ref);
++}
++
++void fthd_put(struct fthd_private *dev_priv)
++{
++	kref_put(&dev_priv->ref, fthd_release);
++}
++
++static void fthd_pci_release_mem(struct fthd_private *dev_priv)
++{
++	if (dev_priv->s2_io) {
++		pci_iounmap(dev_priv->pdev, dev_priv->s2_io);
++		dev_priv->s2_io = NULL;
++	}
++	if (dev_priv->s2_mem) {
++		pci_iounmap(dev_priv->pdev, dev_priv->s2_mem);
++		dev_priv->s2_mem = NULL;
+ 	}
++	if (dev_priv->isp_io) {
++		pci_iounmap(dev_priv->pdev, dev_priv->isp_io);
++		dev_priv->isp_io = NULL;
++	}
++
++	pci_release_selected_regions(dev_priv->pdev, FTHD_PCI_BAR_MASK);
++}
++
++static int fthd_pci_reserve_mem(struct fthd_private *dev_priv)
++{
++	unsigned long len;
++	int ret;
+ 
+-	ret = pci_request_region(dev_priv->pdev, FTHD_PCI_S2_MEM, "S2 MEM");
++	ret = pci_request_selected_regions(dev_priv->pdev, FTHD_PCI_BAR_MASK,
++					   KBUILD_MODNAME);
+ 	if (ret) {
+-		pci_release_region(dev_priv->pdev, FTHD_PCI_ISP_IO);
+-		pci_release_region(dev_priv->pdev, FTHD_PCI_S2_IO);
++		dev_err(&dev_priv->pdev->dev, "Failed to request PCI BARs\n");
+ 		return ret;
+ 	}
+ 
+ 	/* S2 IO */
+-	start = pci_resource_start(dev_priv->pdev, FTHD_PCI_S2_IO);
+ 	len = pci_resource_len(dev_priv->pdev, FTHD_PCI_S2_IO);
+-	dev_priv->s2_io = ioremap(start, len);
++	dev_priv->s2_io = pci_iomap(dev_priv->pdev, FTHD_PCI_S2_IO, 0);
+ 	dev_priv->s2_io_len = len;
+ 
+ 	/* S2 MEM */
+-	start = pci_resource_start(dev_priv->pdev, FTHD_PCI_S2_MEM);
+ 	len = pci_resource_len(dev_priv->pdev, FTHD_PCI_S2_MEM);
+-	dev_priv->s2_mem = ioremap(start, len);
++	dev_priv->s2_mem = pci_iomap(dev_priv->pdev, FTHD_PCI_S2_MEM, 0);
+ 	dev_priv->s2_mem_len = len;
+ 
+ 	/* ISP IO */
+-	start = pci_resource_start(dev_priv->pdev, FTHD_PCI_ISP_IO);
+ 	len = pci_resource_len(dev_priv->pdev, FTHD_PCI_ISP_IO);
+-	dev_priv->isp_io = ioremap(start, len);
++	dev_priv->isp_io = pci_iomap(dev_priv->pdev, FTHD_PCI_ISP_IO, 0);
+ 	dev_priv->isp_io_len = len;
++	if (!dev_priv->s2_io || !dev_priv->s2_mem || !dev_priv->isp_io) {
++		dev_err(&dev_priv->pdev->dev, "Failed to map PCI BARs\n");
++		fthd_pci_release_mem(dev_priv);
++		return -ENOMEM;
++	}
+ 
+ 	pr_debug("Allocated S2 regs (BAR %d). %u bytes at 0x%p\n",
+ 		 FTHD_PCI_S2_IO, dev_priv->s2_io_len, dev_priv->s2_io);
+@@ -315,7 +354,10 @@ static int fthd_pci_set_dma_mask(struct fthd_private *dev_priv,
+ 
+ static void fthd_stop_firmware(struct fthd_private *dev_priv)
+ {
+-		fthd_isp_cmd_stop(dev_priv);
++	if (!dev_priv->channel_io)
++		return;
++
++	fthd_isp_cmd_stop(dev_priv);
+ 	isp_powerdown(dev_priv);
+ }
+ 
+@@ -324,39 +366,31 @@ static void fthd_pci_remove(struct pci_dev *pdev)
+ 	struct fthd_private *dev_priv;
+ 
+ 	dev_priv = pci_get_drvdata(pdev);
+-	if (!dev_priv)
+-		goto out;
++	if (!dev_priv) {
++		pci_disable_device(pdev);
++		return;
++	}
+ 
+-	fthd_debugfs_exit(dev_priv);
++	/* Balance the put in probe and stop the autosuspend timer, so nothing
++	 * can drop the hardware out from under the teardown below.  This does
++	 * not resume the device: fthd_pm_down() is a no-op if runtime PM
++	 * already parked it, and pci_disable_device() has then already run. */
++	pm_runtime_get_noresume(&pdev->dev);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_forbid(&pdev->dev);
++	WRITE_ONCE(dev_priv->removing, true);
+ 
++	fthd_debugfs_exit(dev_priv);
+ 	fthd_v4l2_unregister(dev_priv);
+ 
+-	fthd_stop_firmware(dev_priv);
+-
+-	fthd_irq_uninstall(dev_priv);
+-
+-	cancel_work_sync(&dev_priv->irq_work);
+-
+-	isp_uninit(dev_priv);
+-
+-	fthd_hw_deinit(dev_priv);
+-
+-	fthd_buffer_exit(dev_priv);
+-
+-	pci_disable_msi(pdev);
++	mutex_lock(&dev_priv->ioctl_lock);
++	mutex_lock(&dev_priv->pm_lock);
++	fthd_pm_down(dev_priv);
++	mutex_unlock(&dev_priv->pm_lock);
++	mutex_unlock(&dev_priv->ioctl_lock);
+ 
+-	if (dev_priv->s2_io)
+-		iounmap(dev_priv->s2_io);
+-	if (dev_priv->s2_mem)
+-		iounmap(dev_priv->s2_mem);
+-	if (dev_priv->isp_io)
+-		iounmap(dev_priv->isp_io);
+-
+-	pci_release_region(pdev, FTHD_PCI_S2_IO);
+-	pci_release_region(pdev, FTHD_PCI_S2_MEM);
+-	pci_release_region(pdev, FTHD_PCI_ISP_IO);
+-out:
+-	pci_disable_device(pdev);
++	pci_set_drvdata(pdev, NULL);
++	fthd_put(dev_priv);
+ }
+ 
+ static int fthd_pci_init(struct fthd_private *dev_priv)
+@@ -405,11 +439,9 @@ static int fthd_pci_init(struct fthd_private *dev_priv)
+ fail_irq:
+ 	fthd_irq_uninstall(dev_priv);
+ fail_msi:
+-	pci_disable_msi(pdev);
++	pci_free_irq_vectors(pdev);
+ fail_reserve:
+-	pci_release_region(pdev, FTHD_PCI_S2_IO);
+-	pci_release_region(pdev, FTHD_PCI_S2_MEM);
+-	pci_release_region(pdev, FTHD_PCI_ISP_IO);
++	fthd_pci_release_mem(dev_priv);
+ fail_enable:
+ 	pci_disable_device(pdev);
+ 	return ret;
+@@ -444,6 +476,90 @@ static int fthd_firmware_start(struct fthd_private *dev_priv)
+ 
+ }
+ 
++/*
++ * Take the hardware down: stop the firmware, release the interrupt, the BARs
++ * and the DMA buffers, and hand the device back to the PCI core so it can drop
++ * it into D3.  dev_priv, the V4L2 registration and the debugfs tree all
++ * survive, so an open file descriptor and the /dev/videoN node outlive this.
++ *
++ * Idempotent, and the only thing that clears @suspended is fthd_pm_up().  The
++ * caller holds pm_lock, except in fthd_pci_remove() where nothing else can be
++ * running any more.
++ */
++static void fthd_pm_down(struct fthd_private *dev_priv)
++{
++	struct pci_dev *pdev = dev_priv->pdev;
++
++	if (dev_priv->suspended)
++		return;
++
++	/* The channel goes with the firmware, so no image-quality command may
++	 * be sent until streaming brings it back and replays the controls. */
++	dev_priv->channel_running = false;
++
++	fthd_stop_firmware(dev_priv);
++	fthd_irq_uninstall(dev_priv);
++	cancel_work_sync(&dev_priv->irq_work);
++	fthd_hw_deinit(dev_priv);
++	isp_uninit(dev_priv);
++	fthd_buffer_exit(dev_priv);
++	pci_clear_master(pdev);
++	pci_free_irq_vectors(pdev);
++	fthd_pci_release_mem(dev_priv);
++	pci_disable_device(pdev);
++	dev_priv->suspended = true;
++}
++
++/*
++ * Reverse of fthd_pm_down().  The PCI core has already restored config space
++ * and put the device back in D0 by the time this runs; everything above that
++ * - the DDR training and the firmware image - has to be redone from scratch,
++ * because powering the ISP off loses it.
++ */
++static int fthd_pm_up(struct fthd_private *dev_priv)
++{
++	struct pci_dev *pdev = dev_priv->pdev;
++	int ret;
++
++	if (!dev_priv->suspended)
++		return 0;
++
++	ret = fthd_pci_init(dev_priv);
++	if (ret)
++		return ret;
++
++	ret = fthd_buffer_init(dev_priv);
++	if (ret)
++		goto fail_pci;
++
++	/* Resume is on the path of every camera open(); the wide DDR check is
++	 * probe-only. */
++	ret = fthd_hw_init(dev_priv, false);
++	if (ret)
++		goto fail_buffer;
++
++	ret = fthd_firmware_start(dev_priv);
++	if (ret)
++		goto fail_hw;
++
++	dev_priv->suspended = false;
++	return 0;
++
++fail_hw:
++	fthd_hw_deinit(dev_priv);
++	isp_uninit(dev_priv);
++fail_buffer:
++	fthd_buffer_exit(dev_priv);
++fail_pci:
++	fthd_irq_uninstall(dev_priv);
++	cancel_work_sync(&dev_priv->irq_work);
++	pci_clear_master(pdev);
++	pci_free_irq_vectors(pdev);
++	fthd_pci_release_mem(dev_priv);
++	pci_disable_device(pdev);
++	return ret;
++}
++
+ static int fthd_pci_probe(struct pci_dev *pdev,
+ 			  const struct pci_device_id *entry)
+ {
+@@ -458,20 +574,20 @@ static int fthd_pci_probe(struct pci_dev *pdev,
+ 		dev_err(&pdev->dev, "Failed to allocate memory\n");
+ 		return -ENOMEM;
+ 	}
++	kref_init(&dev_priv->ref);
++	dev_priv->pdev = pdev;
+ 
+ 	dev_priv->ddr_model = 4;
+ 	dev_priv->ddr_speed = 450;
+ 	dev_priv->frametime = 40; /* 25 fps */
+ 
+ 	spin_lock_init(&dev_priv->io_lock);
+-	mutex_init(&dev_priv->vb2_queue_lock);
+ 
+ 	mutex_init(&dev_priv->ioctl_lock);
++	mutex_init(&dev_priv->pm_lock);
+ 	INIT_LIST_HEAD(&dev_priv->buffer_queue);
+ 	INIT_WORK(&dev_priv->irq_work, fthd_irq_work);
+ 
+-	dev_priv->pdev = pdev;
+-
+ 	ret = fthd_pci_init(dev_priv);
+ 	if (ret)
+ 		goto fail_work;
+@@ -502,6 +618,17 @@ static int fthd_pci_probe(struct pci_dev *pdev,
+ 	 * because runtime PM replays it on every resume. */
+ 	dev_info(&pdev->dev, "camera ready: DDR %u MHz, %u-bit DMA\n",
+ 		 dev_priv->ddr_speed, dev_priv->dma_mask);
++
++	pm_runtime_set_autosuspend_delay(&pdev->dev, FTHD_AUTOSUSPEND_DELAY_MS);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	/* The PCI core forbids runtime PM on a device until either userspace
++	 * (power/control) or the driver explicitly opts in. */
++	if (runtime_pm)
++		pm_runtime_allow(&pdev->dev);
++	/* pci_device_probe() took a runtime-PM reference and leaves it to the
++	 * driver to drop.  From here on the camera is only powered while
++	 * something has it open. */
++	fthd_pm_put(dev_priv);
+ 	return 0;
+ fail_v4l2:
+ 	fthd_v4l2_unregister(dev_priv);
+@@ -509,40 +636,79 @@ fail_firmware:
+ 	fthd_stop_firmware(dev_priv);
+ fail_hw:
+ 	fthd_hw_deinit(dev_priv);
++	isp_uninit(dev_priv);
+ fail_buffer:
+ 	fthd_buffer_exit(dev_priv);
+ fail_pci:
+ 	fthd_irq_uninstall(dev_priv);
+-	pci_disable_msi(pdev);
+-	pci_release_region(pdev, FTHD_PCI_S2_IO);
+-	pci_release_region(pdev, FTHD_PCI_S2_MEM);
+-	pci_release_region(pdev, FTHD_PCI_ISP_IO);
++	cancel_work_sync(&dev_priv->irq_work);
++	pci_clear_master(pdev);
++	pci_free_irq_vectors(pdev);
++	fthd_pci_release_mem(dev_priv);
+ 	pci_disable_device(pdev);
++	pci_set_drvdata(pdev, NULL);
+ 
+ fail_work:
+ 	cancel_work_sync(&dev_priv->irq_work);
+-	kfree(dev_priv);
++	fthd_put(dev_priv);
+ 	return ret;
+ }
+ 
+ #ifdef CONFIG_PM
+-static int fthd_pci_suspend(struct pci_dev *pdev, pm_message_t state)
++/*
++ * Runtime PM.  These run with no V4L2 lock held - a runtime resume is reached
++ * from open() and from the debugfs accessors - so they take pm_lock only.
++ */
++static int fthd_runtime_suspend(struct device *dev)
+ {
+-	fthd_pci_remove(pdev);
++	struct fthd_private *dev_priv = dev_get_drvdata(dev);
++	int ret = 0;
+ 
+-	return 0;
++	if (!dev_priv)
++		return 0;
++
++	mutex_lock(&dev_priv->pm_lock);
++	/* Streaming holds a runtime-PM reference through the open file
++	 * descriptor, so this should be unreachable during ordinary runtime PM;
++	 * refuse rather than pull the buffers out from under vb2 if it ever is
++	 * not.  System sleep is different: fthd_suspend() has already stopped
++	 * the channel, returned every buffer with an error and released its ISP
++	 * mappings, but the vb2 allocations intentionally survive for userspace
++	 * to recover with STREAMOFF/STREAMON after resume. */
++	if (vb2_is_busy(&dev_priv->vb2_queue) &&
++	    !dev_priv->system_suspending) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	fthd_pm_down(dev_priv);
++
++out_unlock:
++	mutex_unlock(&dev_priv->pm_lock);
++	return ret;
+ }
+ 
+-static int fthd_pci_resume(struct pci_dev *pdev)
++static int fthd_runtime_resume(struct device *dev)
+ {
+-	fthd_pci_probe(pdev, NULL);
++	struct fthd_private *dev_priv = dev_get_drvdata(dev);
++	int ret;
+ 
+-	return 0;
++	if (!dev_priv)
++		return 0;
++
++	mutex_lock(&dev_priv->pm_lock);
++	ret = fthd_pm_up(dev_priv);
++	mutex_unlock(&dev_priv->pm_lock);
++	return ret;
+ }
++
++static const struct dev_pm_ops fthd_pm_ops = {
++	SET_RUNTIME_PM_OPS(fthd_runtime_suspend, fthd_runtime_resume, NULL)
++};
+ #endif /* CONFIG_PM */
+ 
+ static const struct pci_device_id fthd_pci_id_table[] = {
+-	{ PCI_DEVICE(0x14e4, 0x1570), 4 },
++	{ PCI_DEVICE(0x14e4, 0x1570) },
+ 	{ 0, },
+ };
+ 
+@@ -550,11 +716,9 @@ static struct pci_driver fthd_pci_driver = {
+ 	.name = KBUILD_MODNAME,
+ 	.probe = fthd_pci_probe,
+ 	.remove = fthd_pci_remove,
+-	.shutdown = fthd_pci_remove,
+ 	.id_table = fthd_pci_id_table,
+ #ifdef CONFIG_PM
+-	.suspend = fthd_pci_suspend,
+-	.resume = fthd_pci_resume,
++	.driver.pm = &fthd_pm_ops,
+ #endif
+ };
+ 
+diff --git a/fthd_drv.h b/fthd_drv.h
+index 2adad07..6c0eeba 100644
+--- a/fthd_drv.h
++++ b/fthd_drv.h
+@@ -11,9 +11,11 @@
+ #define _FTHD_DRV_H
+ 
+ #include <linux/pci.h>
++#include <linux/kref.h>
+ #include <linux/spinlock.h>
+ #include <linux/wait.h>
+ #include <linux/mutex.h>
++#include <linux/pm_runtime.h>
+ #include <linux/version.h>
+ #include <media/videobuf2-dma-sg.h>
+ #include <media/v4l2-device.h>
+@@ -54,7 +56,9 @@ struct fthd_private {
+ 	struct v4l2_device v4l2_dev;
+ 	struct video_device *videodev;
+ 	struct mutex ioctl_lock;
+-	int users;
++	struct kref ref;
++	bool removing;
++	bool v4l2_registered;
+ 	/* lock for synchronizing with irq/workqueue */
+ 	spinlock_t io_lock;
+ 
+@@ -112,14 +116,54 @@ struct fthd_private {
+ 	struct fthd_fmt fmt;
+ 
+ 	struct vb2_queue vb2_queue;
+-	struct mutex vb2_queue_lock;
+ 	struct list_head buffer_queue;
+ 	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
+ 
+ 	struct v4l2_ctrl_handler v4l2_ctrl_handler;
++	/* True between a successful fthd_start_channel() and fthd_stop_channel().
++	 * The ISP only accepts the image-quality commands while the channel is
++	 * running, so s_ctrl consults this rather than failing when it isn't. */
++	bool channel_running;
+ 	int frametime;
+ 	unsigned int sequence;
++	/* Serialises the hardware up/down transitions and @suspended. Runtime
++	 * callbacks take only this lock; paths that also shut userspace out take
++	 * ioctl_lock first, then pm_lock. */
++	struct mutex pm_lock;
++	bool suspended;
++	/* Set across a system-sleep transition.  The system suspend callback
++	 * deliberately invalidates allocated vb2 buffers before asking the
++	 * runtime-PM core to force the hardware down, so runtime suspend must not
++	 * reject that particular transition merely because vb2 is still busy. */
++	bool system_suspending;
+ 	struct dentry *debugfs;
+ };
+ 
++bool fthd_get(struct fthd_private *dev_priv);
++void fthd_put(struct fthd_private *dev_priv);
++
++/* Bring the camera out of runtime suspend and hold it there.  Returns 0 with a
++ * reference held, or a negative error with none.  Not usable from atomic
++ * context, and not from anything holding pm_lock. */
++static inline int fthd_pm_get(struct fthd_private *dev_priv)
++{
++	return pm_runtime_resume_and_get(&dev_priv->pdev->dev);
++}
++
++/* Drop the reference taken by fthd_pm_get() and restart the autosuspend
++ * timer. */
++static inline void fthd_pm_put(struct fthd_private *dev_priv)
++{
++	if (READ_ONCE(dev_priv->removing)) {
++		pm_runtime_put_noidle(&dev_priv->pdev->dev);
++		return;
++	}
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6,17,0)
++	/* Folded into pm_runtime_put_autosuspend() in 6.17, and removed
++	 * outright once the tree-wide conversion finished. */
++	pm_runtime_mark_last_busy(&dev_priv->pdev->dev);
++#endif
++	pm_runtime_put_autosuspend(&dev_priv->pdev->dev);
++}
++
+ #endif
+diff --git a/fthd_hw.c b/fthd_hw.c
+index 835016e..a55d27c 100644
+--- a/fthd_hw.c
++++ b/fthd_hw.c
+@@ -705,10 +705,15 @@ int fthd_hw_init(struct fthd_private *dev_priv, bool full_verify)
+ 	FTHD_ISP_REG_WRITE(0, ISP_REG_40004);
+ 
+ 	ret = isp_init(dev_priv);
+-	if (ret)
+-	    goto out;
++	if (ret) {
++		/* isp_init() allocates incrementally; unwind partial initialisation
++		 * here so probe and runtime-resume failures cannot leak ISP memory. */
++		if (dev_priv->mem)
++			isp_uninit(dev_priv);
++		goto out;
++	}
+ 
+-	dev_info(&dev_priv->pdev->dev, "Enabling interrupts\n");
++	dev_dbg(&dev_priv->pdev->dev, "Enabling interrupts\n");
+ 	fthd_irq_enable(dev_priv);
+ out:
+ 	return ret;
+diff --git a/fthd_isp.c b/fthd_isp.c
+index 2ffdbb3..03ded4c 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -36,6 +36,8 @@ int isp_mem_init(struct fthd_private *dev_priv)
+ 	if (!dev_priv->firmware) {
+ 		dev_err(&dev_priv->pdev->dev,
+ 			"Failed to preallocate firmware memory\n");
++		kfree(dev_priv->mem);
++		dev_priv->mem = NULL;
+ 		return -ENOMEM;
+ 	}
+ 	return 0;
+@@ -191,6 +193,14 @@ static void isp_free_channel_info(struct fthd_private *priv)
+ 	}
+ 	kfree(priv->channels);
+ 	priv->channels = NULL;
++	priv->num_channels = 0;
++	priv->channel_terminal = NULL;
++	priv->channel_debug = NULL;
++	priv->channel_shared_malloc = NULL;
++	priv->channel_io = NULL;
++	priv->channel_buf_h2t = NULL;
++	priv->channel_buf_t2h = NULL;
++	priv->channel_io_t2h = NULL;
+ }
+ 
+ static struct fw_channel *isp_get_chan_index(struct fthd_private *priv, const char *name)
+@@ -1275,6 +1285,15 @@ int fthd_stop_channel(struct fthd_private *dev_priv, int channel)
+ 	return fthd_isp_cmd_channel_temporal_filter_stop(dev_priv, 0);
+ }
+ 
++/*
++ * Bring the ISP up: memory map, firmware, heap and IPC channels.
++ *
++ * Allocation is incremental and no error path here unwinds. That is
++ * deliberate: every failure returns straight to fthd_hw_init(), which calls
++ * isp_uninit() whenever dev_priv->mem is set and so reclaims however far this
++ * got in one place. Do not add per-error cleanup — isp_uninit() is not a
++ * partial teardown, it touches the whole register block.
++ */
+ int isp_init(struct fthd_private *dev_priv)
+ {
+ 	struct isp_mem_obj *fw_queue, *heap, *fw_args;
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 690deb3..709145a 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -304,12 +304,58 @@ static const struct vb2_ops vb2_queue_ops = {
+ #endif
+ };
+ 
+-static struct v4l2_file_operations fthd_vdev_fops = {
++/*
++ * An open file descriptor is what keeps the camera powered: runtime PM parks
++ * the ISP whenever nothing has /dev/videoN open, and the reference taken here
++ * is what brings it back.  Held across the whole life of the fd rather than
++ * just streaming, because every ioctl below talks to the firmware.
++ */
++static int fthd_v4l2_open(struct file *filp)
++{
++	struct fthd_private *dev_priv = video_drvdata(filp);
++	int ret;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++	if (READ_ONCE(dev_priv->removing)) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++
++	ret = fthd_pm_get(dev_priv);
++	if (ret)
++		goto out_unlock;
++	if (READ_ONCE(dev_priv->removing)) {
++		fthd_pm_put(dev_priv);
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++
++	ret = v4l2_fh_open(filp);
++	if (ret)
++		fthd_pm_put(dev_priv);
++
++out_unlock:
++	mutex_unlock(&dev_priv->ioctl_lock);
++	return ret;
++}
++
++static int fthd_v4l2_close(struct file *filp)
++{
++	struct fthd_private *dev_priv = video_drvdata(filp);
++	int ret;
++
++	ret = vb2_fop_release(filp);
++	fthd_pm_put(dev_priv);
++
++	return ret;
++}
++
++static const struct v4l2_file_operations fthd_vdev_fops = {
+ 	.owner          = THIS_MODULE,
+-	.open           = v4l2_fh_open,
++	.open           = fthd_v4l2_open,
+ 
+ 	.read		= vb2_fop_read,
+-	.release        = vb2_fop_release,
++	.release        = fthd_v4l2_close,
+ 	.poll           = vb2_fop_poll,
+ 	.mmap           = vb2_fop_mmap,
+ 	.unlocked_ioctl = video_ioctl2
+@@ -675,6 +721,13 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
+ 	.g_volatile_ctrl = fthd_g_volatile_ctrl,
+ 	.s_ctrl = fthd_s_ctrl,
+ };
++static void fthd_video_device_release(struct video_device *vdev)
++{
++	struct fthd_private *dev_priv = video_get_drvdata(vdev);
++
++	video_device_release(vdev);
++	fthd_put(dev_priv);
++}
+ 
+ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ {
+@@ -694,6 +747,13 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 		ret = -ENOMEM;
+ 		goto fail;
+ 	}
++	/* The video_device can outlive PCI unbind while an fd remains open. */
++	if (WARN_ON_ONCE(!fthd_get(dev_priv))) {
++		video_device_release(vdev);
++		ret = -ENODEV;
++		goto fail;
++	}
++	vdev->release = fthd_video_device_release;
+ 	dev_priv->videodev = vdev;
+ 
+ 	q = &dev_priv->vb2_queue;
+@@ -709,11 +769,11 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ #else
+ 	q->min_queued_buffers = 1;
+ #endif
+-	q->lock = &dev_priv->vb2_queue_lock;
++	q->lock = &dev_priv->ioctl_lock;
+ 
+ 	ret = vb2_queue_init(q);
+ 	if (ret)
+-		goto fail;
++		goto fail_vdev_alloc;
+ 
+ 	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 4);
+ 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+@@ -728,27 +788,23 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 			  V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
+ 
+ 	if (dev_priv->v4l2_ctrl_handler.error) {
+-		pr_err("failed to setup control handlers\n");
++		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");
++		ret = dev_priv->v4l2_ctrl_handler.error;
+ 		v4l2_ctrl_handler_free(&dev_priv->v4l2_ctrl_handler);
+-		goto fail;
++		goto fail_queue;
+ 	}
+ 
+ 	vdev->v4l2_dev = v4l2_dev;
+ 	strscpy(vdev->name, "Apple Facetime HD", sizeof(vdev->name));
+ 	vdev->vfl_dir = VFL_DIR_RX;
++	vdev->lock = &dev_priv->ioctl_lock;
+ 	vdev->fops = &fthd_vdev_fops;
+ 	vdev->ioctl_ops = &fthd_ioctl_ops;
+ 	vdev->queue = q;
+-	vdev->release = video_device_release;
+ 	vdev->ctrl_handler = &dev_priv->v4l2_ctrl_handler;
+ 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+ 			    V4L2_CAP_STREAMING;
+ 	video_set_drvdata(vdev, dev_priv);
+-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+-	if (ret) {
+-		video_device_release(vdev);
+-		goto fail_vdev;
+-	}
+ 	/* Default to the sensor's native resolution (detected at probe), or the
+ 	 * generic ceiling if detection didn't run. */
+ 	dev_priv->fmt.fmt.width  = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
+@@ -758,22 +814,40 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 	dev_priv->fmt.planes = 1;
+ 
+ 	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		vdev->release(vdev);
++		vdev = NULL;
++		dev_priv->videodev = NULL;
++		goto fail_ctrl;
++	}
++	WRITE_ONCE(dev_priv->v4l2_registered, true);
+ 
+ 	return 0;
+-fail_vdev:
++fail_ctrl:
+ 	v4l2_ctrl_handler_free(&dev_priv->v4l2_ctrl_handler);
++fail_queue:
++	vb2_queue_release(q);
++fail_vdev_alloc:
++	if (vdev)
++		vdev->release(vdev);
+ fail:
++	dev_priv->videodev = NULL;
+ 	v4l2_device_unregister(&dev_priv->v4l2_dev);
+ 	return ret;
+ }
+ 
+ void fthd_v4l2_unregister(struct fthd_private *dev_priv)
+ {
++	struct video_device *vdev = dev_priv->videodev;
+ 
++	if (!vdev)
++		return;
++
++	WRITE_ONCE(dev_priv->v4l2_registered, false);
++	v4l2_device_disconnect(&dev_priv->v4l2_dev);
++	vb2_video_unregister_device(vdev);
++	dev_priv->videodev = NULL;
+ 	v4l2_ctrl_handler_free(&dev_priv->v4l2_ctrl_handler);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+-	vb2_dma_sg_cleanup_ctx(dev_priv->alloc_ctx);
+-#endif
+-	video_unregister_device(dev_priv->videodev);
+ 	v4l2_device_unregister(&dev_priv->v4l2_dev);
+ }

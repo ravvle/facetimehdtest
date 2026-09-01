@@ -1,0 +1,428 @@
+From f4ea06ba151df2b1934a96bb3d1cfda404f6dc7c Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 14/19] pm: park a stream across system suspend and put it back
+
+Suspend errored the vb2 queue, so DQBUF and poll() returned -EIO and only
+STREAMOFF plus a fresh STREAMON could recover. Most applications do not
+attempt that - they report a camera failure - which made "the camera stops
+working after suspend" the visible behaviour of closing a laptop lid during
+a video call. Suspending while streaming could also fail outright with
+-EBUSY and leave the machine awake.
+
+Nothing about the hardware requires either. Suspend does have to give up the
+ISP-side resources, because the power cycle destroys them: the firmware
+image, the channel, the S2 IOMMU mapping of every buffer and the descriptors
+that point at them. But the vb2 buffers are ordinary memory and survive
+untouched, and the descriptors are cheap to rebuild - which is what a QBUF
+does on every frame anyway.
+
+So the stream is parked rather than failed. fthd_v4l2_suspend_stop() stops
+the channel and frees the ISP-side objects, but records the buffers vb2 has
+handed to the driver and leaves them owned by it: the queue is not errored
+and no buffer is returned, so userspace - frozen for the whole transition -
+has nothing to observe. fthd_v4l2_resume_start() runs from the system resume
+callback, after the firmware is back and before userspace is thawed. It
+re-prepares each parked buffer through the same buf_prepare() path a QBUF
+uses, restarts the channel, replays the control values and resubmits the
+buffers, so capture continues into the same buffers the application was
+already reading. Frame sequence numbers continue across the sleep rather
+than restarting at zero; STREAMON still resets them, because the application
+never asked for a new stream.
+
+The work happens in the .resume callback rather than a work item, because
+that is the one place where userspace is guaranteed frozen: no STREAMOFF,
+close() or REQBUFS can race the rebuild and the parked pointers cannot go
+stale. The cost is that the channel-start command sequence sits in the
+device-resume phase, and it is paid only when something actually held the
+camera streaming.
+
+On failure the old behaviour is the fallback: the parked buffers come back
+with an error, the queue is marked, and the application can recover with
+STREAMOFF/STREAMON. If pm_runtime_force_suspend() fails, the stream is
+unparked immediately, since the PM core will not call .resume for a device
+whose suspend failed.
+
+The shutdown and kexec path keeps the old behaviour, because there is no
+resume coming: a reader blocked in DQBUF is better told with -EIO than left
+waiting for frames that will never arrive. It also stops being an alias for
+.remove() - a shutdown must quiesce DMA and interrupts, not unregister the
+V4L2 device and free the state that an application's open fd still points at
+for whatever remains of this boot.
+---
+ fthd_drv.c  | 117 +++++++++++++++++++++++++++++++++
+ fthd_drv.h  |  12 ++++
+ fthd_v4l2.c | 181 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ fthd_v4l2.h |   2 +
+ 4 files changed, 312 insertions(+)
+
+diff --git a/fthd_drv.c b/fthd_drv.c
+index 05309ca..e396322 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -391,6 +391,35 @@ static void fthd_stop_firmware(struct fthd_private *dev_priv)
+ 	isp_powerdown(dev_priv);
+ }
+ 
++/*
++ * Reboot/kexec.  Convention for .shutdown is to quiesce DMA and IRQs and go
++ * no further: unlike .remove(), it must not unregister the V4L2 device or
++ * free dev_priv, since a file descriptor an application still holds open has
++ * to stay valid for whatever remains of this boot.  Shares fthd_suspend()'s
++ * hardware transition rather than reimplementing a partial one - the same
++ * "drop the stream, then power down" sequence is exactly what's needed here.
++ * It does not park the stream for a resume the way fthd_suspend() does: this
++ * boot has no resume left, so a reader waiting on frames has to be told.
++ */
++static void fthd_pci_shutdown(struct pci_dev *pdev)
++{
++	struct fthd_private *dev_priv = pci_get_drvdata(pdev);
++
++	if (!dev_priv)
++		return;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++
++	if (vb2_is_busy(&dev_priv->vb2_queue))
++		fthd_v4l2_suspend_stop(dev_priv, false);
++
++	mutex_lock(&dev_priv->pm_lock);
++	fthd_pm_down(dev_priv);
++	mutex_unlock(&dev_priv->pm_lock);
++
++	mutex_unlock(&dev_priv->ioctl_lock);
++}
++
+ static void fthd_pci_remove(struct pci_dev *pdev)
+ {
+ 	struct fthd_private *dev_priv;
+@@ -749,7 +778,94 @@ static int fthd_runtime_resume(struct device *dev)
+ 	return ret;
+ }
+ 
++/* Whether the ISP is up right now.  The sleep callbacks need it to tell "put
++ * the stream back" apart from "the camera is parked and nothing may talk to
++ * it"; @suspended is pm_lock's to answer. */
++static bool fthd_is_powered(struct fthd_private *dev_priv)
++{
++	bool powered;
++
++	mutex_lock(&dev_priv->pm_lock);
++	powered = !dev_priv->suspended;
++	mutex_unlock(&dev_priv->pm_lock);
++
++	return powered;
++}
++
++/*
++ * System sleep.  Same hardware transition as the runtime path, but a system
++ * suspend can arrive with the device open, so it takes the V4L2 ioctl lock to
++ * shut userspace out for the duration.  pm_runtime_force_suspend()/resume()
++ * invoke the runtime callbacks above, preserving the lock order ioctl_lock ->
++ * pm_lock.
++ *
++ * It must not reuse fthd_runtime_suspend()'s refusal: a runtime suspend that
++ * returns -EBUSY is just deferred, while an error here aborts the entire sleep
++ * transition and leaves the machine awake.  A camera left streaming - by an
++ * app the user forgot about, or one that had not noticed the lid closing - is
++ * an ordinary thing to suspend with, so the stream is parked instead, and
++ * fthd_resume() puts it back.
++ */
++static int __maybe_unused fthd_suspend(struct device *dev)
++{
++	struct fthd_private *dev_priv = dev_get_drvdata(dev);
++	int ret;
++
++	if (!dev_priv)
++		return 0;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++
++	if (vb2_is_busy(&dev_priv->vb2_queue))
++		fthd_v4l2_suspend_stop(dev_priv, true);
++
++	/* The force helpers use the runtime-PM usage count to remember whether
++	 * the camera was actually in use.  In particular, an idle camera still
++	 * waiting out its autosuspend delay is left off after resume instead of
++	 * needlessly reloading its firmware and immediately tearing it down. */
++	dev_priv->system_suspending = true;
++	ret = pm_runtime_force_suspend(dev);
++	if (ret) {
++		dev_priv->system_suspending = false;
++		/* The PM core does not resume a device whose suspend failed, so
++		 * fthd_resume() will not run and nothing else would ever unpark
++		 * the stream stopped above. */
++		fthd_v4l2_resume_start(dev_priv, fthd_is_powered(dev_priv));
++	}
++
++	mutex_unlock(&dev_priv->ioctl_lock);
++	return ret;
++}
++
++static int __maybe_unused fthd_resume(struct device *dev)
++{
++	struct fthd_private *dev_priv = dev_get_drvdata(dev);
++	int ret;
++
++	if (!dev_priv)
++		return 0;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++	/* This reloads the ISP only when a runtime-PM reference was held before
++	 * system sleep.  Otherwise the camera remains runtime-suspended until
++	 * the next open(). */
++	ret = pm_runtime_force_resume(dev);
++	dev_priv->system_suspending = false;
++
++	/* Restart the stream fthd_suspend() parked, before userspace is thawed.
++	 * Only a stream can have parked anything, and one cannot exist without
++	 * an open fd holding a runtime-PM reference, so the force-resume above
++	 * has necessarily powered the hardware back up by the time this matters.
++	 * It reloads no firmware of its own; the cost is the channel-start
++	 * command sequence, paid only when something was actually capturing. */
++	fthd_v4l2_resume_start(dev_priv, fthd_is_powered(dev_priv));
++
++	mutex_unlock(&dev_priv->ioctl_lock);
++	return ret;
++}
++
+ static const struct dev_pm_ops fthd_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(fthd_suspend, fthd_resume)
+ 	SET_RUNTIME_PM_OPS(fthd_runtime_suspend, fthd_runtime_resume, NULL)
+ };
+ #endif /* CONFIG_PM */
+@@ -792,6 +908,7 @@ static struct pci_driver fthd_pci_driver = {
+ 	.name = KBUILD_MODNAME,
+ 	.probe = fthd_pci_probe,
+ 	.remove = fthd_pci_remove,
++	.shutdown = fthd_pci_shutdown,
+ 	.id_table = fthd_pci_id_table,
+ 	.err_handler = &fthd_pci_err_handler,
+ #ifdef CONFIG_PM
+diff --git a/fthd_drv.h b/fthd_drv.h
+index 8bedd9c..670c459 100644
+--- a/fthd_drv.h
++++ b/fthd_drv.h
+@@ -122,6 +122,18 @@ struct fthd_private {
+ 	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
+ 	unsigned int protocol_errors;
+ 
++	/* The buffers vb2 had handed to the driver when a system suspend
++	 * arrived, and whether the queue was streaming at the time. The resume
++	 * callback uses them to rebuild the ISP-side mappings the power cycle
++	 * destroyed and put the stream back on the air, so that an application
++	 * capturing across a suspend never sees an error. Only touched under
++	 * ioctl_lock, and only between fthd_v4l2_suspend_stop() and
++	 * fthd_v4l2_resume_start(); userspace is frozen for that whole window,
++	 * so the buffers cannot be freed under them. */
++	struct vb2_buffer *parked_bufs[FTHD_BUFFERS];
++	unsigned int parked_count;
++	bool parked_streaming;
++
+ 	struct v4l2_ctrl_handler v4l2_ctrl_handler;
+ 	/* True between a successful fthd_start_channel() and fthd_stop_channel().
+ 	 * The ISP only accepts the image-quality commands while the channel is
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index ccce2c5..69cba17 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -722,6 +722,187 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
+ 	 * wait without a timeout for firmware that has already failed a command. */
+ 	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
+ }
++
++/*
++ * Give the hardware up for a system suspend that arrived with buffers
++ * allocated - usually with an app streaming.  Unlike a runtime suspend this
++ * cannot be refused: returning an error from the system sleep callback aborts
++ * the whole transition and the machine stays awake, so the stream has to come
++ * down under userspace instead.
++ *
++ * Everything the buffers own lives in ISP memory that fthd_pm_down() is about
++ * to destroy, so it is all released here while the registers are still mapped.
++ *
++ * With @park set that is the *only* thing userspace loses.  The buffers vb2 has
++ * handed to the driver are recorded and left owned by it - not returned, not
++ * errored - so fthd_v4l2_resume_start() can rebuild their mappings, restart the
++ * channel and let the application's feed simply continue.  Holding raw vb2
++ * pointers across the sleep is safe because only userspace can free a buffer,
++ * and it is frozen for the whole transition.
++ *
++ * @park is false on the shutdown path, where nothing will ever resume.  There
++ * the buffers are returned with an error and the queue is marked, so an
++ * application blocked in DQBUF or poll() gets -EIO instead of waiting for
++ * frames that are not coming.  That is also the fallback the resume path takes
++ * if it cannot get the stream going again: vb2 only re-runs buf_prepare() after
++ * a STREAMOFF, so marking the queue is what tells an app it has to do one
++ * before its STREAMON.
++ *
++ * Runs under ioctl_lock, with the hardware still powered: buffers can only be
++ * allocated while /dev/videoN is open, and an open fd holds a runtime-PM
++ * reference.
++ */
++void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park)
++{
++	unsigned int parked = 0;
++	unsigned long flags;
++	int i;
++
++	if (dev_priv->channel_running) {
++		dev_priv->channel_running = false;
++		if (fthd_stop_channel(dev_priv, 0))
++			dev_warn(&dev_priv->pdev->dev,
++				 "failed to stop firmware channel for suspend\n");
++	}
++
++	/* Same reason as in fthd_stop_streaming(): no decimated buffer may be
++	 * sent to an ISP that is about to lose power, and none may still be in
++	 * flight when the loop below detaches every slot. */
++	cancel_work_sync(&dev_priv->requeue_work);
++
++	dev_priv->parked_count = 0;
++	dev_priv->parked_streaming = false;
++
++	if (park) {
++		/* Slot order, not queue order: which buffer the firmware fills
++		 * first is its choice either way, and every one of these goes
++		 * back to it before a single frame is produced. */
++		spin_lock_irqsave(&dev_priv->buffer_lock, flags);
++		for (i = 0; i < FTHD_BUFFERS; i++) {
++			struct h2t_buf_ctx *ctx = &dev_priv->h2t_bufs[i];
++
++			if ((ctx->state == BUF_DRV_QUEUED ||
++			     ctx->state == BUF_HW_QUEUED) && ctx->vb) {
++				dev_priv->parked_bufs[parked++] = ctx->vb;
++				/* Detach the buffer from its slot under the
++				 * same lock that records it, so a buffer return
++				 * racing this suspend cannot also complete one
++				 * the resume has already promised to resubmit.
++				 * Such a return finds an unowned slot and is
++				 * reported as the protocol error it is. */
++				ctx->state = BUF_ALLOC;
++				ctx->vb = NULL;
++			}
++		}
++		spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
++
++		dev_priv->parked_count = parked;
++		dev_priv->parked_streaming = vb2_is_streaming(&dev_priv->vb2_queue);
++	} else {
++		fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
++	}
++
++	for (i = 0; i < FTHD_BUFFERS; i++)
++		fthd_release_buffer_ctx(dev_priv, &dev_priv->h2t_bufs[i]);
++
++	if (!park)
++		vb2_queue_error(&dev_priv->vb2_queue);
++}
++
++/*
++ * Put back what fthd_v4l2_suspend_stop() parked, so an application that was
++ * capturing when the lid closed keeps capturing when it opens - no -EIO, no
++ * STREAMOFF/STREAMON dance, nothing for it to notice beyond the gap in
++ * timestamps.
++ *
++ * The ISP has just been reloaded from scratch, so every buffer vb2 still
++ * considers the driver's needs its descriptor and its S2 mapping built again.
++ * fthd_buffer_prepare() is exactly that work and all four slots are free by
++ * now, so each one lands where a fresh QBUF would put it; the channel then
++ * comes back up and takes them, replaying the control values on the way.
++ *
++ * @powered says whether the force-resume actually brought the hardware back.
++ * It does so exactly when something still held the camera open, which is also
++ * the only way buffers can exist - so a false here means something is wrong,
++ * not that the camera is merely idle.
++ *
++ * Runs under ioctl_lock from the system resume callback, with userspace still
++ * frozen.  If any of it fails there is nothing better to do than what the
++ * driver did before it learned to resume: hand the buffers back with an error
++ * and mark the queue.
++ */
++void fthd_v4l2_resume_start(struct fthd_private *dev_priv, bool powered)
++{
++	unsigned int i = 0, parked = dev_priv->parked_count;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!parked && !dev_priv->parked_streaming)
++		return;
++
++	dev_priv->parked_count = 0;
++
++	/* Nothing below may touch the hardware if it did not come back up - and
++	 * the channel restart at the end would do so even with no buffers to
++	 * restore. */
++	if (!powered) {
++		ret = -ENODEV;
++		goto fail;
++	}
++
++	for (i = 0; i < parked; i++) {
++		struct vb2_buffer *vb = dev_priv->parked_bufs[i];
++		struct h2t_buf_ctx *ctx;
++
++		ret = fthd_buffer_prepare(vb);
++		if (ret)
++			break;
++
++		/* The state a QBUF before STREAMON leaves behind, which is what
++		 * the submit loop in fthd_stream_start() looks for. */
++		spin_lock_irqsave(&dev_priv->buffer_lock, flags);
++		ctx = fthd_ctx_for_vb(dev_priv, vb);
++		if (ctx && ctx->state == BUF_ALLOC)
++			ctx->state = BUF_DRV_QUEUED;
++		else
++			ctx = NULL;
++		spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
++
++		if (!ctx) {
++			/* Cannot happen - the prepare above just claimed a slot
++			 * for this buffer.  Drop whatever it did claim so the
++			 * error path below finds no slot owning this buffer and
++			 * hands it back itself, rather than either path assuming
++			 * the other did. */
++			fthd_buffer_cleanup(vb);
++			ret = -ENOBUFS;
++			break;
++		}
++	}
++
++	if (!ret && dev_priv->parked_streaming)
++		ret = fthd_stream_start(dev_priv, false);
++
++	if (!ret) {
++		dev_priv->parked_streaming = false;
++		return;
++	}
++
++fail:
++	dev_priv->parked_streaming = false;
++	dev_warn(&dev_priv->pdev->dev,
++		 "could not resume capture (%d); failing the queue\n", ret);
++
++	/* Buffers that never made it back into a slot are still the driver's as
++	 * far as vb2 is concerned and have to be handed over explicitly.  The
++	 * ones that did are reachable through their slots. */
++	for (; i < parked; i++)
++		vb2_buffer_done(dev_priv->parked_bufs[i], VB2_BUF_STATE_ERROR);
++
++	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
++	vb2_queue_error(&dev_priv->vb2_queue);
++}
++
+ static const struct vb2_ops vb2_queue_ops = {
+ 	.queue_setup            = fthd_buffer_queue_setup,
+ 	.buf_prepare            = fthd_buffer_prepare,
+diff --git a/fthd_v4l2.h b/fthd_v4l2.h
+index 49c0d53..ed9ec0d 100644
+--- a/fthd_v4l2.h
++++ b/fthd_v4l2.h
+@@ -30,5 +30,7 @@ struct fthd_private;
+ extern int fthd_v4l2_register(struct fthd_private *dev_priv);
+ extern void fthd_v4l2_unregister(struct fthd_private *dev_priv);
+ extern void fthd_v4l2_refresh_crop(struct fthd_private *dev_priv);
++extern void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park);
++extern void fthd_v4l2_resume_start(struct fthd_private *dev_priv, bool powered);
+ 
+ #endif

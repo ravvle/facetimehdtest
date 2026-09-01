@@ -1,0 +1,664 @@
+From af04f891f0b207f63e11d22b1254521641d0ea19 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Tue, 1 Sep 2026 12:00:00 +1000
+Subject: [PATCH 17/19] debugfs: expose the confirmed firmware readbacks
+
+Fifteen firmware GETs whose wire layout has been recovered and confirmed on
+hardware, as mode-0400 debugfs files under
+/sys/kernel/debug/facetimehd/<pci-id>/: sensor_temperature_raw, awb_cct_raw,
+ae_bias_raw, five AE gain-cap and integration-time limits, ae_metering_mode_raw,
+ae_frame_rate_{max,min}_raw, awb_2nd_gain_raw and crop_raw.
+
+The governing rule after the lockups that removed the inferred controls is:
+GET first, and a recovered value reaches V4L2 only once its meaning is
+established. Everything whose meaning is not established stays here. Each
+read takes ioctl_lock, requires a running channel (an idle read fails with
+-EPIPE rather than powering the ISP up), holds a runtime-PM reference for
+exactly one command, and adds nothing to STREAMON or resume. Nothing polls,
+and there is no arbitrary-opcode input. They are named "raw" because
+firmware documents no units or ranges.
+
+Three of them answer their question rather than asking one:
+
+  - sensor_temperature_raw returns -1 on this sensor, always: cold after
+    boot, after ten minutes of continuous streaming, and under bright, dark,
+    warm and cool light. A physical scale, however unknown, would have moved
+    with die temperature over that stream, so -1 is a not-supported
+    sentinel. The file prints "-1 (unavailable)", raw number first. hwmon
+    registration would be wrong even on a sensor that returns something
+    else, because that ABI requires millidegrees Celsius and no reading here
+    establishes a unit.
+  - ae_frame_rate_max_raw and ae_frame_rate_min_raw both read 7672, which is
+    29.97 fps in Q8.8. Minimum equal to maximum means the window is clamped
+    to the sensor's single rate - the readable reason behind the behavioural
+    conclusion that produced frame decimation. Both handlers compare a
+    channel-context field against 0xffff first and take a path that never
+    writes the response word when it matches, so a zero means "firmware
+    wrote nothing", not "zero frames per second"; the file says so.
+  - awb_2nd_gain_raw returns three words, not the two an R/B reading would
+    predict, so they are printed positionally with no colour named. All
+    three read exactly 4096 while the CCT estimate reported 2785 - markedly
+    warm light, in which a live gain triple cannot be equal on all three
+    channels - which makes it a manual stage sitting at unity.
+
+crop_raw returns eight words where CISP_CMD_CH_CROP_SET sends four: the
+first group tracks the programmed crop exactly, the second stays at
+0 0 1280 720 across every rectangle tested. The struct names them rect1 and
+rect2 by position rather than by meaning, because that identification is one
+machine's.
+---
+ fthd_debugfs.c | 258 +++++++++++++++++++++++++++++++++++++++++++++++++
+ fthd_isp.c     | 190 ++++++++++++++++++++++++++++++++++++
+ fthd_isp.h     | 100 +++++++++++++++++++
+ 3 files changed, 548 insertions(+)
+
+diff --git a/fthd_debugfs.c b/fthd_debugfs.c
+index fd7efaa..da103cb 100644
+--- a/fthd_debugfs.c
++++ b/fthd_debugfs.c
+@@ -239,6 +239,217 @@ static int seq_channel_debug_read(struct seq_file *seq, void *data)
+ 	return seq_channel_read(seq, dev_priv, &dev_priv->channel_debug);
+ }
+ 
++enum fthd_fw_readback {
++	FTHD_FW_SENSOR_TEMPERATURE,
++	FTHD_FW_AWB_CCT,
++	FTHD_FW_AE_BIAS,
++	FTHD_FW_AE_GAIN_CAP,
++	FTHD_FW_AE_GAIN_CAP_MIN,
++	FTHD_FW_AE_GAIN_CAP_MAX_WITH_EXP,
++	FTHD_FW_AE_GAIN_CAP_OFF,
++	FTHD_FW_AE_INTEGRATION_TIME_MAX,
++	FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN,
++	FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX,
++	FTHD_FW_AE_METERING_MODE,
++	FTHD_FW_AE_FRAME_RATE_MAX,
++	FTHD_FW_AE_FRAME_RATE_MIN,
++	FTHD_FW_AWB_2ND_GAIN,
++	FTHD_FW_CROP,
++};
++
++
++/*
++ * These files are deliberately unlike the ring-state diagnostics above.
++ * Reading one sends exactly one statically whitelisted firmware GET.  Requiring
++ * an already-running channel keeps a read from booting or configuring the ISP,
++ * and ioctl_lock prevents STREAMOFF from racing the command.
++ */
++static int seq_firmware_readback(struct seq_file *seq,
++				 enum fthd_fw_readback readback)
++{
++	struct fthd_private *dev_priv = seq->private;
++	u32 value, tag;
++	u32 gain[3];
++	u32 rect1[4], rect2[4];
++	s32 signed_value;
++	u16 bias;
++	u8 mode;
++	int ret;
++
++	mutex_lock(&dev_priv->ioctl_lock);
++	if (READ_ONCE(dev_priv->removing)) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (!dev_priv->channel_running) {
++		ret = -EPIPE;
++		goto out_unlock;
++	}
++
++	ret = fthd_pm_get(dev_priv);
++	if (ret)
++		goto out_unlock;
++
++	switch (readback) {
++	case FTHD_FW_SENSOR_TEMPERATURE:
++		ret = fthd_isp_cmd_channel_sensor_temperature(dev_priv, 0,
++							      &signed_value);
++		/*
++		 * The raw value stays first on the line so anything parsing
++		 * this file keeps working, with the interpretation appended
++		 * rather than substituted.  -1 has now been read on a
++		 * MacBookAir7,2 at every sampled condition, including after ten
++		 * minutes of continuous streaming, which is what a
++		 * not-supported sentinel looks like and not what an unknown
++		 * temperature scale looks like.  Saying so here is what stops
++		 * the next reader from trying to calibrate it.
++		 */
++		if (!ret)
++			seq_printf(seq, "%d%s\n", signed_value,
++				   signed_value == FTHD_SENSOR_TEMPERATURE_NONE ?
++				   " (unavailable)" : "");
++		break;
++	case FTHD_FW_AWB_CCT:
++		ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_BIAS:
++		ret = fthd_isp_cmd_channel_ae_bias_get(dev_priv, 0, &bias, &tag);
++		if (!ret)
++			seq_printf(seq, "bias=%u tag=%u\n", bias, tag);
++		break;
++	case FTHD_FW_AE_GAIN_CAP:
++		ret = fthd_isp_cmd_channel_ae_gain_cap_get(dev_priv, 0, &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_GAIN_CAP_MIN:
++		ret = fthd_isp_cmd_channel_ae_gain_cap_min_get(dev_priv, 0,
++							     &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_GAIN_CAP_MAX_WITH_EXP:
++		ret = fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get(dev_priv,
++								      0, &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_GAIN_CAP_OFF:
++		ret = fthd_isp_cmd_channel_ae_gain_cap_off_get(dev_priv, 0,
++							     &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_INTEGRATION_TIME_MAX:
++		ret = fthd_isp_cmd_channel_ae_integration_time_max_get(dev_priv,
++								      0, &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN:
++		ret = fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(
++			dev_priv, 0, &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX:
++		ret = fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(
++			dev_priv, 0, &value);
++		if (!ret)
++			seq_printf(seq, "%u\n", value);
++		break;
++	case FTHD_FW_AE_METERING_MODE:
++		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
++							       &mode);
++		if (!ret)
++			seq_printf(seq, "%u\n", mode);
++		break;
++	case FTHD_FW_AE_FRAME_RATE_MAX:
++	case FTHD_FW_AE_FRAME_RATE_MIN:
++		ret = readback == FTHD_FW_AE_FRAME_RATE_MAX ?
++			fthd_isp_cmd_channel_ae_frame_rate_max_get(dev_priv, 0,
++								   &value) :
++			fthd_isp_cmd_channel_ae_frame_rate_min_get(dev_priv, 0,
++								   &value);
++		/*
++		 * Firmware skips writing the value when its internal limit is
++		 * unset, leaving the zero this driver submitted.  Say that
++		 * rather than reporting a rate of zero, which is not what it
++		 * means.  See fthd_isp.c for the sentinel evidence.
++		 */
++		if (!ret)
++			seq_printf(seq, "%u%s\n", value,
++				   value ? "" : " (not written by firmware)");
++		break;
++	case FTHD_FW_AWB_2ND_GAIN:
++		ret = fthd_isp_cmd_channel_awb_2nd_gain_get(dev_priv, 0, gain);
++		/*
++		 * Three words whose individual meanings are unrecovered, so
++		 * they are printed positionally and not as named colour gains.
++		 */
++		if (!ret)
++			seq_printf(seq, "%u %u %u\n",
++				   gain[0], gain[1], gain[2]);
++		break;
++	case FTHD_FW_CROP:
++		ret = fthd_isp_cmd_channel_crop_get(dev_priv, 0, rect1, rect2);
++		/*
++		 * Two four-word rectangles.  Which one the ISP actually
++		 * latched is unestablished, so neither is labelled; a reader
++		 * comparing them against the rectangle S_SELECTION requested
++		 * is the point of the file.
++		 */
++		if (!ret)
++			seq_printf(seq, "%u %u %u %u\n%u %u %u %u\n",
++				   rect1[0], rect1[1], rect1[2], rect1[3],
++				   rect2[0], rect2[1], rect2[2], rect2[3]);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	fthd_pm_put(dev_priv);
++out_unlock:
++	mutex_unlock(&dev_priv->ioctl_lock);
++	return ret;
++}
++
++#define FTHD_FW_READBACK_SHOW(_name, _readback)                         \
++	static int _name(struct seq_file *seq, void *data)                \
++	{                                                                  \
++		return seq_firmware_readback(seq, _readback);                \
++	}
++
++FTHD_FW_READBACK_SHOW(seq_sensor_temperature_raw_read,
++			  FTHD_FW_SENSOR_TEMPERATURE);
++FTHD_FW_READBACK_SHOW(seq_awb_cct_raw_read, FTHD_FW_AWB_CCT);
++FTHD_FW_READBACK_SHOW(seq_ae_bias_raw_read, FTHD_FW_AE_BIAS);
++FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_raw_read, FTHD_FW_AE_GAIN_CAP);
++FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_min_raw_read,
++			  FTHD_FW_AE_GAIN_CAP_MIN);
++FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_max_with_exp_raw_read,
++			  FTHD_FW_AE_GAIN_CAP_MAX_WITH_EXP);
++FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_off_raw_read,
++			  FTHD_FW_AE_GAIN_CAP_OFF);
++FTHD_FW_READBACK_SHOW(seq_ae_integration_time_max_raw_read,
++			  FTHD_FW_AE_INTEGRATION_TIME_MAX);
++FTHD_FW_READBACK_SHOW(seq_ae_sensor_integration_time_min_raw_read,
++			  FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN);
++FTHD_FW_READBACK_SHOW(seq_ae_sensor_integration_time_max_raw_read,
++			  FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX);
++FTHD_FW_READBACK_SHOW(seq_ae_metering_mode_raw_read,
++			  FTHD_FW_AE_METERING_MODE);
++FTHD_FW_READBACK_SHOW(seq_ae_frame_rate_max_raw_read,
++			  FTHD_FW_AE_FRAME_RATE_MAX);
++FTHD_FW_READBACK_SHOW(seq_ae_frame_rate_min_raw_read,
++			  FTHD_FW_AE_FRAME_RATE_MIN);
++FTHD_FW_READBACK_SHOW(seq_awb_2nd_gain_raw_read, FTHD_FW_AWB_2ND_GAIN);
++FTHD_FW_READBACK_SHOW(seq_crop_raw_read, FTHD_FW_CROP);
++
++#undef FTHD_FW_READBACK_SHOW
+ 
+ static int fthd_debugfs_seq_open(struct inode *inode, struct file *file,
+ 				 int (*show)(struct seq_file *, void *))
+@@ -290,6 +501,21 @@ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_io_t2h_read);
+ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_h2t_read);
+ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_t2h_read);
+ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_debug_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_sensor_temperature_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_awb_cct_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_bias_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_min_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_max_with_exp_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_off_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_integration_time_max_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_sensor_integration_time_min_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_sensor_integration_time_max_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_metering_mode_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_frame_rate_max_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_ae_frame_rate_min_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_awb_2nd_gain_raw_read);
++FTHD_DEBUGFS_SEQ_FOPS(seq_crop_raw_read);
+ 
+ static const struct file_operations fops_debug = {
+ 	.write = fthd_store_debug,
+@@ -339,6 +565,38 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
+ 			    &seq_channel_buf_t2h_read_fops);
+ 	debugfs_create_file("channel_debug", 0400, d, dev_priv,
+ 			    &seq_channel_debug_read_fops);
++	debugfs_create_file("sensor_temperature_raw", 0400, d, dev_priv,
++			    &seq_sensor_temperature_raw_read_fops);
++	debugfs_create_file("awb_cct_raw", 0400, d, dev_priv,
++			    &seq_awb_cct_raw_read_fops);
++	debugfs_create_file("ae_bias_raw", 0400, d, dev_priv,
++			    &seq_ae_bias_raw_read_fops);
++	debugfs_create_file("ae_gain_cap_raw", 0400, d, dev_priv,
++			    &seq_ae_gain_cap_raw_read_fops);
++	debugfs_create_file("ae_gain_cap_min_raw", 0400, d, dev_priv,
++			    &seq_ae_gain_cap_min_raw_read_fops);
++	debugfs_create_file("ae_gain_cap_max_with_exp_raw", 0400, d, dev_priv,
++			    &seq_ae_gain_cap_max_with_exp_raw_read_fops);
++	debugfs_create_file("ae_gain_cap_off_raw", 0400, d, dev_priv,
++			    &seq_ae_gain_cap_off_raw_read_fops);
++	debugfs_create_file("ae_integration_time_max_raw", 0400, d, dev_priv,
++			    &seq_ae_integration_time_max_raw_read_fops);
++	debugfs_create_file("ae_sensor_integration_time_min_raw", 0400, d,
++			    dev_priv,
++			    &seq_ae_sensor_integration_time_min_raw_read_fops);
++	debugfs_create_file("ae_sensor_integration_time_max_raw", 0400, d,
++			    dev_priv,
++			    &seq_ae_sensor_integration_time_max_raw_read_fops);
++	debugfs_create_file("ae_metering_mode_raw", 0400, d, dev_priv,
++			    &seq_ae_metering_mode_raw_read_fops);
++	debugfs_create_file("ae_frame_rate_max_raw", 0400, d, dev_priv,
++			    &seq_ae_frame_rate_max_raw_read_fops);
++	debugfs_create_file("ae_frame_rate_min_raw", 0400, d, dev_priv,
++			    &seq_ae_frame_rate_min_raw_read_fops);
++	debugfs_create_file("awb_2nd_gain_raw", 0400, d, dev_priv,
++			    &seq_awb_2nd_gain_raw_read_fops);
++	debugfs_create_file("crop_raw", 0400, d, dev_priv,
++			    &seq_crop_raw_read_fops);
+ 	debugfs_create_file("debug", 0600, d, dev_priv, &fops_debug);
+ 	dev_priv->debugfs = d;
+ 	fthd_debugfs_users++;
+diff --git a/fthd_isp.c b/fthd_isp.c
+index 4ebb5f6..93b388b 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -1247,6 +1247,25 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
+ 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_SET, &cmd, sizeof(cmd), &len);
+ }
+ 
++int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv,
++					       int channel, u8 *mode)
++{
++	struct isp_cmd_channel_ae_metering_mode_get cmd;
++	int ret, len = sizeof(cmd);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	ret = fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_GET,
++			   &cmd, sizeof(cmd), &len);
++	if (ret)
++		return ret;
++	if (len != sizeof(cmd))
++		return -EIO;
++
++	*mode = cmd.mode;
++	return 0;
++}
++
+ /*
+  * Anti-banding.  CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET is one of the
+  * Apple-private opcodes. Firmware reads one word at command offset +0x0c,
+@@ -1267,6 +1286,177 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
+ 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
+ }
+ 
++/* Not exposed to userspace: encoding and tag semantics are still unknown. */
++int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv,
++					  int channel, u16 bias, u32 tag)
++{
++	struct isp_cmd_channel_ae_bias_set cmd;
++	int len;
++
++	pr_debug("set ae bias raw %u tag %u\n", bias, tag);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.bias = bias;
++	cmd.tag = tag;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_SET, &cmd, sizeof(cmd), &len);
++}
++
++int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv,
++				      int channel, int bias)
++{
++	return fthd_isp_cmd_channel_ae_bias_set_raw(dev_priv, channel,
++						     (u16)bias, 0);
++}
++
++int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel,
++				      u16 *bias, u32 *tag)
++{
++	struct isp_cmd_channel_ae_bias_get cmd;
++	int ret, len = sizeof(cmd);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_GET,
++			   &cmd, sizeof(cmd), &len);
++	if (ret)
++		return ret;
++	if (len != sizeof(cmd))
++		return -EIO;
++
++	*bias = cmd.bias;
++	*tag = cmd.tag;
++	return 0;
++}
++
++static int fthd_isp_cmd_channel_u32_get(struct fthd_private *dev_priv,
++					enum fthd_isp_cmds opcode, int channel,
++					u32 *value)
++{
++	struct isp_cmd_channel_u32 cmd;
++	int ret, len = sizeof(cmd);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	ret = fthd_isp_cmd(dev_priv, opcode, &cmd, sizeof(cmd), &len);
++	if (ret)
++		return ret;
++	if (len != sizeof(cmd))
++		return -EIO;
++
++	*value = cmd.value;
++	return 0;
++}
++
++#define FTHD_DEFINE_CHANNEL_U32_GET(_name, _opcode)                         \
++	int _name(struct fthd_private *dev_priv, int channel, u32 *value)    \
++	{                                                                    \
++		return fthd_isp_cmd_channel_u32_get(dev_priv, _opcode, channel, \
++						    value);                  \
++	}
++
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_get,
++			    CISP_CMD_CH_AE_GAIN_CAP_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_min_get,
++			    CISP_CMD_CH_AE_GAIN_CAP_MIN_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get,
++			    CISP_CMD_CH_AE_GAIN_CAP_MAX_WITH_EXP_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_off_get,
++			    CISP_CMD_CH_AE_GAIN_CAP_OFF_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_integration_time_max_get,
++			    CISP_CMD_CH_AE_INTEGRATION_TIME_MAX_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_sensor_integration_time_min_get,
++			    CISP_CMD_CH_AE_SENSOR_INTEGRATION_TIME_MIN_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_sensor_integration_time_max_get,
++			    CISP_CMD_CH_AE_SENSOR_INTEGRATION_TIME_MAX_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_awb_cct_get,
++			    CISP_CMD_CH_AWB_CCT_GET)
++/*
++ * Frame-rate limits.  Handlers 0x49a7c and 0x49ac2 store a single word at
++ * +0x0c through a shared helper picked by its third argument (1 maximum, 0
++ * minimum), so the plain scalar layout is right.  Both first compare a
++ * channel-context field against 0xffff and take a path that does not write
++ * +0x0c when it matches, which is a not-set sentinel: in that case the caller
++ * reads back the zero it submitted rather than a rate.  A zero here therefore
++ * means "firmware wrote nothing", not "zero fps"; the readback says so.
++ */
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_frame_rate_max_get,
++			    CISP_CMD_CH_AE_FRAME_RATE_MAX_GET)
++FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_frame_rate_min_get,
++			    CISP_CMD_CH_AE_FRAME_RATE_MIN_GET)
++
++#undef FTHD_DEFINE_CHANNEL_U32_GET
++
++int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv,
++					  int channel, u32 gain[3])
++{
++	struct isp_cmd_channel_awb_2nd_gain_get cmd;
++	int ret, len = sizeof(cmd);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_2ND_GAIN_GET,
++			   &cmd, sizeof(cmd), &len);
++	if (ret)
++		return ret;
++	if (len != sizeof(cmd))
++		return -EIO;
++
++	memcpy(gain, cmd.gain, sizeof(cmd.gain));
++	return 0;
++}
++
++int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
++				  u32 rect1[4], u32 rect2[4])
++{
++	struct isp_cmd_channel_crop_get cmd;
++	int ret, len = sizeof(cmd);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_CROP_GET,
++			   &cmd, sizeof(cmd), &len);
++	if (ret)
++		return ret;
++	if (len != sizeof(cmd))
++		return -EIO;
++
++	memcpy(rect1, cmd.rect1, sizeof(cmd.rect1));
++	memcpy(rect2, cmd.rect2, sizeof(cmd.rect2));
++	return 0;
++}
++
++/*
++ * Sensor die temperature, returned exactly as the firmware reports it.
++ *
++ * Firmware disassembly proves the signed field width, but not its scale. This
++ * It is exposed only by the root-readable, on-demand active-stream debugfs
++ * probe. It is not connected to hwmon or V4L2 and is never polled; see
++ * FIRMWARE-REVERSE-ENGINEERING.md.
++ */
++int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw)
++{
++	struct isp_cmd_channel_sensor_temperature cmd;
++	int ret, len;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	len = sizeof(cmd);
++	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEMPERATURE_GET, &cmd, sizeof(cmd), &len);
++	if (ret)
++		return ret;
++
++	/* A response short enough not to contain the field would leave the
++	 * zero from the memset above looking like a real reading. */
++	if (len < (int)sizeof(cmd))
++		return -EIO;
++
++	*raw = cmd.temperature;
++	pr_debug("sensor temperature raw %d\n", *raw);
++	return 0;
++}
++
+ int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness)
+ {
+ 	struct isp_cmd_channel_brightness_set cmd;
+diff --git a/fthd_isp.h b/fthd_isp.h
+index b9038b9..66043af 100644
+--- a/fthd_isp.h
++++ b/fthd_isp.h
+@@ -681,6 +681,89 @@ struct isp_cmd_channel_ae_flicker_freq_set {
+ 	u32 freq;
+ };
+ 
++/*
++ * The dormant payload definitions below record layouts recovered from this
++ * machine's firmware. Apple documents neither their units nor their semantic
++ * ranges. Setters are deliberately not connected to V4L2, debugfs, hwmon, or
++ * automatic stream setup. A small set of proven GET layouts is exposed only
++ * through root-readable, active-stream debugfs files; see
++ * FIRMWARE-REVERSE-ENGINEERING.md.
++ */
++
++/* Firmware reads a 16-bit value and a 32-bit tag. The encoding and tag
++ * semantics are not known; see FIRMWARE-REVERSE-ENGINEERING.md. */
++struct isp_cmd_channel_ae_bias_set {
++	u32 channel;
++	u16 bias;
++	u16 reserved;
++	u32 tag;
++};
++
++/* The corresponding GET writes the same bias/tag pair after the channel. */
++struct isp_cmd_channel_ae_bias_get {
++	u32 channel;
++	u16 bias;
++	u16 reserved;
++	u32 tag;
++};
++
++/* Scalar AE and AWB commands carry one firmware-native word after channel. */
++struct isp_cmd_channel_u32 {
++	u32 channel;
++	u32 value;
++};
++
++/*
++ * Crop GET (CISP_CMD_CH_CROP_GET) response, recovered from firmware handler
++ * 0x478a2: it writes eight consecutive words at command offsets +0x0c..+0x28,
++ * copied straight out of two groups of channel-context fields (0xd0..0xdc then
++ * 0xb0..0xbc).  CISP_CMD_CH_CROP_SET sends a single four-word rectangle, so
++ * this returns two of them.  Which group is the rectangle the host asked for
++ * and which is the geometry the ISP actually latched is NOT established, so
++ * they are named by position rather than by meaning.  Do not rename these to
++ * "requested"/"effective" without hardware evidence that says which is which.
++ */
++struct isp_cmd_channel_crop_get {
++	u32 channel;
++	u32 rect1[4];
++	u32 rect2[4];
++};
++
++/*
++ * AWB second-gain GET (CISP_CMD_CH_AWB_2ND_GAIN_GET) response.  Handler
++ * 0x4a9b4 loads three destination pointers - +0x0c, +0x10 and +0x14 - and
++ * calls a channel-context vtable entry to fill them.  Three words, not the two
++ * an R/B reading would predict, so no channel is named here.
++ */
++struct isp_cmd_channel_awb_2nd_gain_get {
++	u32 channel;
++	u32 gain[3];
++};
++
++/* Apple AE metering-mode GET writes one byte at command offset +0x0c. */
++struct isp_cmd_channel_ae_metering_mode_get {
++	u32 channel;
++	u8 mode;
++	u8 reserved[3];
++};
++
++/* Sensor die temperature.  A GET: @temperature is written by the firmware.
++ * The scale is not documented; see fthd_isp_cmd_channel_sensor_temperature()
++ * for how the driver avoids having to guess one. */
++struct isp_cmd_channel_sensor_temperature {
++	u32 channel;
++	s32 temperature;
++};
++
++/* What this firmware returns on a sensor that does not report a temperature.
++ * Repeated sampling on a MacBookAir7,2 - cold, after ten minutes of streaming,
++ * and across every lighting condition - never produced anything else, which is
++ * a sentinel rather than a reading on an unknown scale.  The driver reports it
++ * as unavailable instead of publishing it; a sensor that does return real data
++ * would show up as some other value and would still need its scale established
++ * before it could become an hwmon channel. */
++#define FTHD_SENSOR_TEMPERATURE_NONE (-1)
++
+ struct isp_cmd_channel_start {
+ 	u32 channel;
+ };
+@@ -773,7 +856,24 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
+ extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_priv, int channel);
+ extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
+ extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
++extern int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv, int channel, u8 *mode);
+ extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
++extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias);
++extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
++extern int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel, u16 *bias, u32 *tag);
++extern int fthd_isp_cmd_channel_ae_gain_cap_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_gain_cap_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_gain_cap_off_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_awb_cct_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv, int channel, u32 gain[3]);
++extern int fthd_isp_cmd_channel_ae_frame_rate_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_ae_frame_rate_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
++extern int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel, u32 rect1[4], u32 rect2[4]);
++extern int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw);
+ extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
+ extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);
+ extern int fthd_isp_cmd_channel_saturation_set(struct fthd_private *dev_priv, int channel, int saturation);
