@@ -12,3 +12,4 @@ packaging/out/
 graphify-out/cost.json
 graphify-out/cache/
 firmware.bin
+results/

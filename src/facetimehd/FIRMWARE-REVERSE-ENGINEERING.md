@@ -565,9 +565,6 @@ is not evidence that a capture happened.**
   Accepted, persistent and teardown-safe here, but not measurably different.
 - Whether any sensor other than this one returns something other than the `-1`
   temperature sentinel, and its scale if so.
-- Confirm on hardware that a crop flush with the far sensor edge streams and
-  that `crop_raw`'s first group equals the programmed `(x, y, width, height)`
-  (`hw-validate.sh --only crop-geometry`). See DOWNSTREAM.md, "Cropping".
 - Per-frame spacing under decimation. The mean rate is measured and correct at
   every divisor, but `hw-validate.sh` checks only a coarse bunching floor, so
   uneven spacing at the right average would still pass.

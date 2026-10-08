@@ -232,29 +232,31 @@ replayed.
 - probe and DDR;
 - 57/57 applicable `v4l2-compliance` tests;
 - NV12 planes checked against YUYV;
-- decimation at divisors 1–30, every rate within 1.7%;
+- decimation at divisors 1–30, within 2.7% apart from the divisor-1 reading
+  under "Open";
 - five runtime-PM cycles;
 - suspend while streaming, with the viewer continuing;
 - `STREAMOFF` on signal;
 - every control value, readback and same-value setter;
-- metering modes `0..3`.
-
-No run logged a firmware timeout, bad buffer tag, IOMMU fault or oops.
+- metering modes `0..3`;
+- crop on the array's edges, both axes and two crop widths: every rectangle
+  streamed, ones past an edge were pulled back to it, and `crop_raw` echoed
+  the programmed `(x, y, width, height)`.
 
 **Not yet run on hardware since the last driver change:**
-- `crop-geometry`. The old centred-origin rule (`left <= (sw - w)/2`) matched
-  20 of 20 rectangles, and that is exactly what sending `left + width` as the
-  width predicts. Confirm that a rectangle flush with the far edge now streams
-  and that `crop_raw` echoes `(x, y, width, height)`.
-- Eight buffers and the 200 ms AE settle. Both were validated upstream on other
-  models.
+- Eight queued buffers (`v4l2-ctl` queues four).
+- The 200 ms AE settle, as distinct from a later frame. Both were validated
+  upstream on other models.
 
 **Open:**
 - Everything above on any machine other than this one MacBookAir7,2.
 - Whether NV12 is native 4:2:0 or a downsample.
 - Visible effect of anti-banding, exposure mode and metering under controlled
   light.
-- Whether the AE frame-rate window can lower the delivered rate.
+- Whether the AE frame-rate window can lower the delivered rate. One run
+  delivered a steady 27.66 fps at divisor 1 for about 9 s, against 29.97
+  elsewhere in the same run. AE lengthening exposure in dim light is the likely
+  cause; re-check in bright, steady light.
 - Per-frame spacing under decimation (only a coarse bunching check exists).
 - Reboot or kexec while streaming.
 - Recovery from a real firmware timeout.
