@@ -50,23 +50,21 @@ METERING_WAIT_SECS="${METERING_WAIT_SECS:-8}"
 METERING_RESTART_AE="${METERING_RESTART_AE:-0}"
 METERING_RESTORE_NODE=""
 METERING_ORIGINAL=""
-# Requested rates, not divisors. The driver derives divisor = round(30/rate)
-# and caps it at FTHD_MAX_FPS_DIVISOR (30), so 1 fps is the slowest stream it
-# can produce and is the case that leans hardest on the requeue path.
-DECIMATION_RATES="${DECIMATION_RATES:-30 15 10 6 3 1}"
-DECIMATION_SECS="${DECIMATION_SECS:-6}"
-DECIMATION_TOLERANCE="${DECIMATION_TOLERANCE:-12}"
-DECIMATION_OFF_SECS="${DECIMATION_OFF_SECS:-5}"
+# Requested rates. S_PARM programs the ISP's AE frame-rate window, which
+# accepts 2-30 fps, so 2 fps is the slowest stream the driver can produce.
+FRAMERATE_RATES="${FRAMERATE_RATES:-30 15 10 5 2}"
+FRAMERATE_SECS="${FRAMERATE_SECS:-6}"
+FRAMERATE_TOLERANCE="${FRAMERATE_TOLERANCE:-12}"
+FRAMERATE_OFF_SECS="${FRAMERATE_OFF_SECS:-5}"
 CROP_WIDTH="${CROP_WIDTH:-640}"
 CROP_HEIGHT="${CROP_HEIGHT:-360}"
 NV12_FRAMES="${NV12_FRAMES:-10}"
 
 # Removed inferred controls are intentionally not selectable here. Readbacks
-# are in the normal suite after their first complete fault-free run. Decimation
-# and crop are driver logic with no firmware guessing in them, so they run by
-# default; profiling, same-value setter round trips, metering semantics and the
+# are in the normal suite after their first complete fault-free run. Frame
+# rate and crop use hardware-tested commands, so they run by default; profiling, same-value setter round trips, metering semantics and the
 # still-unadvertised NV16 format remain explicit hardware work.
-DEFAULT_SECTIONS="probe timing controls decimation crop nv12 runtimepm suspend wedged readbacks"
+DEFAULT_SECTIONS="probe timing controls framerate crop nv12 runtimepm suspend wedged readbacks"
 ALL_SECTIONS="$DEFAULT_SECTIONS readback-profile roundtrips metering-modes crop-geometry"
 SECTIONS="$DEFAULT_SECTIONS"
 DO_REBOOT=0
@@ -112,14 +110,14 @@ Environment:
                 Seconds before checking each bounded capture (default: 8).
   METERING_RESTART_AE
                 Set to 1 to stop/restart AE around each mode change (default: 0).
-  DECIMATION_RATES
-                Requested frame rates to verify (default: 30 15 10 6 3 1).
-  DECIMATION_SECS
+  FRAMERATE_RATES
+                Requested frame rates to verify (default: 30 15 10 5 2).
+  FRAMERATE_SECS
                 Seconds of steady-state capture per rate (default: 6).
-  DECIMATION_TOLERANCE
+  FRAMERATE_TOLERANCE
                 Percent the measured rate may differ by (default: 12).
-  DECIMATION_OFF_SECS
-                Seconds to stream before the mid-decimation STREAMOFF (default: 5).
+  FRAMERATE_OFF_SECS
+                Seconds to stream before the mid-stream STREAMOFF (default: 5).
   CROP_WIDTH / CROP_HEIGHT
                 Output size used while moving the crop (default: 640x360).
   NV12_FRAMES   Frames captured for the NV12 plane check (default: 10).
@@ -151,17 +149,17 @@ for _s in $SECTIONS; do
 done
 
 for _numeric_name in METERING_SETTLE_FRAMES METERING_CAPTURE_FRAMES \
-                     METERING_WAIT_SECS DECIMATION_SECS DECIMATION_TOLERANCE \
-                     DECIMATION_OFF_SECS CROP_WIDTH CROP_HEIGHT NV12_FRAMES; do
+                     METERING_WAIT_SECS FRAMERATE_SECS FRAMERATE_TOLERANCE \
+                     FRAMERATE_OFF_SECS CROP_WIDTH CROP_HEIGHT NV12_FRAMES; do
     _numeric_value="${!_numeric_name}"
     case "$_numeric_value" in
         ''|*[!0-9]*|0) die "$_numeric_name must be a positive integer" ;;
     esac
 done
 
-for _rate in $DECIMATION_RATES; do
+for _rate in $FRAMERATE_RATES; do
     case "$_rate" in
-        ''|*[!0-9]*|0) die "DECIMATION_RATES must be positive integers" ;;
+        ''|*[!0-9]*|0|1) die "FRAMERATE_RATES must be integers from 2 to 30" ;;
     esac
 done
 
@@ -320,8 +318,8 @@ wait_for_device() {
 # Unbounded, that wedges the whole run rather than failing one check.
 #
 # The bound has to scale with the frame count and the requested rate. Anything
-# fixed either kills a legitimately slow decimated capture - ten frames at 1 fps
-# is ten seconds of correct behaviour - or leaves a starved 30 fps stream
+# fixed either kills a legitimately slow capture - ten frames at 2 fps
+# is five seconds of correct behaviour - or leaves a starved 30 fps stream
 # hanging for minutes. The slack covers open, REQBUFS, and a runtime-PM resume
 # with its DDR retrain and firmware reload.
 CAPTURE_SLACK_SECS="${CAPTURE_SLACK_SECS:-20}"
@@ -2003,15 +2001,14 @@ if wants metering-modes; then
 fi
 
 # ============================================================================
-# Section: decimation
+# Section: framerate
 # DOWNSTREAM.md - "Frame rate"
 #
-# Nothing here guesses at a firmware payload: the divisor is applied to frames
-# the driver has already received, so this is driver logic and runs by default.
-# It answers the three open questions on that item - whether a decimated stream
-# really arrives at the requested rate, whether the requeue path keeps the ISP
-# fed from a small buffer pool, and whether a STREAMOFF in the middle
-# of heavy decimation gives every one of them back.
+# S_PARM programs the ISP's AE frame-rate window, which the sensor follows.
+# This checks that each requested rate is reported back by G_PARM and actually
+# delivered, that S_PARM is refused while streaming (the window only reaches the
+# firmware at channel start), and that a STREAMOFF at the slowest rate returns
+# every buffer.
 #
 # The rate is measured from the difference between a short and a long capture
 # rather than from one capture's duration. v4l2-ctl spends roughly two seconds
@@ -2019,54 +2016,47 @@ fi
 # 30 fps that fixed cost is a third of a six-second measurement: it has to be
 # subtracted, not tolerated.
 # ============================================================================
-if wants decimation; then
-    step "decimation: are requested frame rates actually delivered"
-    log_section "SECTION decimation"
+if wants framerate; then
+    step "framerate: are requested frame rates actually delivered"
+    log_section "SECTION framerate"
 
     [ -n "$DEVICE" ] || wait_for_device || true
     if [ -z "$DEVICE" ]; then
-        result SKIP decimation "no video node"
+        result SKIP framerate "no video node"
     elif ! clock_sane; then
         # Everything below is a duration; without a millisecond clock the only
         # honest result is no result.
-        result FAIL decimation.clock \
+        result FAIL framerate.clock \
             "no usable millisecond clock, so no frame rate can be measured"
     else
         slowest_rate=""
-        slowest_divisor=0
-        for rate in $DECIMATION_RATES; do
-            # What the driver will actually select: divisor = round(30/rate),
-            # clamped to 1..FTHD_MAX_FPS_DIVISOR. Comparing against the
-            # requested rate instead would fail every rate that is not a
-            # divisor of 30, for a reason that is not a defect.
-            divisor="$(awk -v r="$rate" \
-                'BEGIN{d=int(30/r + 0.5); if (d<1) d=1; if (d>30) d=30; print d}')"
-            expect="$(awk -v d="$divisor" 'BEGIN{printf "%.3f", 30/d}')"
-            if [ "$divisor" -gt "$slowest_divisor" ]; then
-                slowest_divisor="$divisor"
+        for rate in $FRAMERATE_RATES; do
+            [ "$rate" -gt 30 ] && rate=30
+            expect="$(awk -v r="$rate" 'BEGIN{printf "%.3f", r}')"
+            if [ -z "$slowest_rate" ] || [ "$rate" -lt "$slowest_rate" ]; then
                 slowest_rate="$rate"
             fi
 
-            log_section "DECIMATION ${rate} fps (divisor $divisor)"
+            log_section "FRAMERATE ${rate} fps"
             dmesg_mark
 
             if ! v4l2-ctl --device "$DEVICE" --set-parm="$rate" >>"$REPORT" 2>&1; then
-                result FAIL "decimation.$rate.set" "S_PARM was rejected"
+                result FAIL "framerate.$rate.set" "S_PARM was rejected"
                 continue
             fi
             got="$(v4l2-ctl --device "$DEVICE" --get-parm 2>/dev/null |
                    sed -n 's/^[[:space:]]*Frames per second:[[:space:]]*\([0-9.]*\).*/\1/p' |
                    head -1)"
             if [ -z "$got" ]; then
-                result FAIL "decimation.$rate.readback" "G_PARM printed no rate"
+                result FAIL "framerate.$rate.readback" "G_PARM printed no rate"
                 continue
             fi
             if awk -v g="$got" -v e="$expect" 'BEGIN{d=g-e; if(d<0)d=-d; exit !(d < 0.01)}'; then
-                result PASS "decimation.$rate.readback" \
-                    "G_PARM reports $got fps, the divisor-$divisor rate"
+                result PASS "framerate.$rate.readback" \
+                    "G_PARM reports $got fps"
             else
-                result FAIL "decimation.$rate.readback" \
-                    "G_PARM reports $got fps, expected $expect for divisor $divisor"
+                result FAIL "framerate.$rate.readback" \
+                    "G_PARM reports $got fps, expected $expect"
                 continue
             fi
 
@@ -2081,7 +2071,7 @@ if wants decimation; then
             # free of v4l2-ctl's fixed start-up cost.
             short_frames=$(( rate * 2 ))
             [ "$short_frames" -ge 4 ] || short_frames=4
-            extra_frames=$(( rate * DECIMATION_SECS ))
+            extra_frames=$(( rate * FRAMERATE_SECS ))
             [ "$extra_frames" -ge 4 ] || extra_frames=4
             long_frames=$(( short_frames + extra_frames ))
 
@@ -2096,10 +2086,10 @@ if wants decimation; then
             fi
             if [ "$short_rc" -ne 0 ] || [ "$long_rc" -ne 0 ]; then
                 if [ "$short_rc" -eq 124 ] || [ "$long_rc" -eq 124 ]; then
-                    result FAIL "decimation.$rate.capture" \
+                    result FAIL "framerate.$rate.capture" \
                         "the stream starved: no buffers arrived before the timeout"
                 else
-                    result FAIL "decimation.$rate.capture" \
+                    result FAIL "framerate.$rate.capture" \
                         "capture failed (status ${short_rc}/${long_rc})"
                 fi
                 continue
@@ -2107,18 +2097,18 @@ if wants decimation; then
             log "frames $short_frames/$long_frames took ${short_ms}/${long_ms} ms"
 
             if [ "$long_ms" -le "$short_ms" ]; then
-                result WARN "decimation.$rate.rate" \
+                result WARN "framerate.$rate.rate" \
                     "the longer capture did not take longer (${short_ms} vs ${long_ms} ms) - unusable timing"
             else
                 measured="$(awk -v n="$extra_frames" -v t="$(( long_ms - short_ms ))" \
                             'BEGIN{printf "%.2f", n * 1000 / t}')"
-                if awk -v m="$measured" -v e="$expect" -v tol="$DECIMATION_TOLERANCE" \
+                if awk -v m="$measured" -v e="$expect" -v tol="$FRAMERATE_TOLERANCE" \
                        'BEGIN{d=m-e; if(d<0)d=-d; exit !(d <= e*tol/100)}'; then
-                    result PASS "decimation.$rate.rate" \
+                    result PASS "framerate.$rate.rate" \
                         "delivered $measured fps against an expected $expect"
                 else
-                    result FAIL "decimation.$rate.rate" \
-                        "delivered $measured fps, expected $expect +/-${DECIMATION_TOLERANCE}%"
+                    result FAIL "framerate.$rate.rate" \
+                        "delivered $measured fps, expected $expect +/-${FRAMERATE_TOLERANCE}%"
                 fi
             fi
 
@@ -2126,65 +2116,73 @@ if wants decimation; then
             # cannot legitimately arrive faster than (N-1)/rate, so a short
             # capture finishing well inside that means the driver released a
             # burst rather than spacing frames out. v4l2-ctl queues four buffers, so
-            # a burst can never be large - this catches a broken divisor, not
+            # a burst can never be large - this catches gross misbehaviour, not
             # small timing noise.
             floor_ms="$(awk -v n="$short_frames" -v e="$expect" \
                         'BEGIN{printf "%d", (n - 1) * 1000 / e * 0.7}')"
             if [ "$short_ms" -ge "$floor_ms" ]; then
-                result PASS "decimation.$rate.spacing" \
+                result PASS "framerate.$rate.spacing" \
                     "$short_frames frames took ${short_ms} ms, at or above the ${floor_ms} ms floor"
             else
-                result WARN "decimation.$rate.spacing" \
+                result WARN "framerate.$rate.spacing" \
                     "$short_frames frames took only ${short_ms} ms against a ${floor_ms} ms floor - frames may be arriving in bursts"
             fi
 
             dmesg_driver >>"$REPORT"
             if faults_present; then
-                result FAIL "decimation.$rate.faults" \
-                    "firmware, buffer or DMA fault during decimated capture"
+                result FAIL "framerate.$rate.faults" \
+                    "firmware, buffer or DMA fault during capture"
             else
-                result PASS "decimation.$rate.faults" \
+                result PASS "framerate.$rate.faults" \
                     "no firmware, buffer, IOMMU or DMAR faults"
             fi
         done
 
-        result INFO decimation.jitter \
+        result INFO framerate.jitter \
             "mean rate only; per-frame spacing is not measured by this test"
 
-        # STREAMOFF while decimation is holding buffers back. At the largest
-        # divisor most buffers are in the requeue path rather than owned by
-        # userspace, which is the state in which a lost buffer would show up.
+        # STREAMOFF at the slowest rate, where buffers sit with the ISP longest,
+        # and S_PARM while streaming, which the driver must refuse.
         if [ -n "$slowest_rate" ]; then
-            log_section "DECIMATION streamoff at ${slowest_rate} fps (divisor $slowest_divisor)"
+            log_section "FRAMERATE streamoff at ${slowest_rate} fps"
             v4l2-ctl --device "$DEVICE" --set-parm="$slowest_rate" >>"$REPORT" 2>&1 || true
             dmesg_mark
             v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
                      --stream-to=/dev/null >>"$REPORT" 2>&1 &
             STREAM_PID=$!
-            sleep "$DECIMATION_OFF_SECS"
+            sleep "$FRAMERATE_OFF_SECS"
             if kill -0 "$STREAM_PID" 2>/dev/null; then
+                if v4l2-ctl --device "$DEVICE" --set-parm=30 >>"$REPORT" 2>&1 &&
+                   ! v4l2-ctl --device "$DEVICE" --get-parm 2>/dev/null |
+                       grep -q "Frames per second:[[:space:]]*${slowest_rate}\.0"; then
+                    result FAIL framerate.busy \
+                        "S_PARM changed the rate of a running stream instead of refusing"
+                else
+                    result PASS framerate.busy \
+                        "S_PARM was refused while streaming"
+                fi
                 kill "$STREAM_PID" 2>/dev/null || true
                 wait "$STREAM_PID" 2>/dev/null || true
                 STREAM_PID=""
                 sleep 2
                 dmesg_driver >>"$REPORT"
                 if faults_present; then
-                    result FAIL decimation.streamoff \
-                        "STREAMOFF under heavy decimation left a buffer, channel or DMA fault"
+                    result FAIL framerate.streamoff \
+                        "STREAMOFF at ${slowest_rate} fps left a buffer, channel or DMA fault"
                 else
-                    result PASS decimation.streamoff \
-                        "STREAMOFF under heavy decimation returned every buffer cleanly"
+                    result PASS framerate.streamoff \
+                        "STREAMOFF at ${slowest_rate} fps returned every buffer cleanly"
                 fi
                 if capture_ok 10; then
-                    result PASS decimation.streamoff.restart \
-                        "capture works again after the mid-decimation STREAMOFF"
+                    result PASS framerate.streamoff.restart \
+                        "capture works again after the mid-stream STREAMOFF"
                 else
-                    result FAIL decimation.streamoff.restart \
-                        "capture failed after the mid-decimation STREAMOFF"
+                    result FAIL framerate.streamoff.restart \
+                        "capture failed after the mid-stream STREAMOFF"
                 fi
             else
-                result FAIL decimation.streamoff \
-                    "the decimated stream exited on its own before STREAMOFF"
+                result FAIL framerate.streamoff \
+                    "the stream exited on its own before STREAMOFF"
                 STREAM_PID=""
             fi
         fi

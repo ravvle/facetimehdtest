@@ -58,11 +58,6 @@ struct h2t_buf_ctx {
 	struct isp_mem_obj *dma_desc_obj;
 	struct dma_descriptor_list dma_desc_list;
 	u64 tag;
-	/* Set when a frame was decimated away for the selected frame rate and
-	 * the buffer is waiting to go back to the ISP rather than to vb2.  Only
-	 * meaningful while @state is BUF_DRV_QUEUED, and only touched under
-	 * fthd_private.buffer_lock. */
-	bool requeue;
 };
 
 extern int fthd_buffer_init(struct fthd_private *dev_priv);

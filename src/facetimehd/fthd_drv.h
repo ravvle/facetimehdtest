@@ -31,6 +31,10 @@
 
 #define FTHD_BUFFERS 8
 
+#define FTHD_FRAME_RATE_SCALE 256U
+#define FTHD_FRAME_RATE_MIN (2 * FTHD_FRAME_RATE_SCALE)
+#define FTHD_FRAME_RATE_MAX (30 * FTHD_FRAME_RATE_SCALE)
+
 enum FW_CHAN_TYPE {
 	FW_CHAN_TYPE_OUT=0,
 	FW_CHAN_TYPE_IN=1,
@@ -139,13 +143,8 @@ struct fthd_private {
 	 * The ISP only accepts the image-quality commands while the channel is
 	 * running, so s_ctrl consults this rather than failing when it isn't. */
 	bool channel_running;
-	/* Frame-rate division.  The sensor delivers a fixed rate and the driver
-	 * passes on one frame in @fps_divisor of it, handing the rest straight
-	 * back to the ISP from @requeue_work; @frame_phase counts within the
-	 * current group.  Both are read and written only under buffer_lock. */
-	unsigned int fps_divisor;
-	unsigned int frame_phase;
-	struct work_struct requeue_work;
+	u32 frame_rate; /* 1/256 fps */
+	int exposure_auto_priority;
 	unsigned int sequence;
 	u64 buffer_tag;
 	/* Serialises the hardware up/down transitions and @suspended. Runtime

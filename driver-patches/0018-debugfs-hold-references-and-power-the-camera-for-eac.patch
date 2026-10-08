@@ -1,4 +1,4 @@
-From 37ecd0822964766294d10aee45c8c3d8005e7d14 Mon Sep 17 00:00:00 2001
+From 6b0d02892ea9bcd5681ccf83f092509e2e3d155e Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 18/21] debugfs: hold references, and power the camera for each

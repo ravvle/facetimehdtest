@@ -19,6 +19,8 @@ Hardware results are from a MacBookAir7,2 with firmware 1.43.0 unless stated;
 - Up to eight buffers within 16 MiB, and `VIDIOC_CREATE_BUFS` accounted
   against the same limits.
 - A 200 ms AE settle.
+- `S_PARM` through the AE frame-rate window (2–30 fps, refused while
+  streaming), and `V4L2_CID_EXPOSURE_AUTO_PRIORITY`.
 - Buffers returned when channel start fails.
 
 ## Safety and correctness
@@ -99,23 +101,10 @@ Half the frame comes out blank, with no IOMMU fault.
 
 ## Frame rate
 
-`S_PARM` delivers the requested rate exactly. It does this by decimation: one
-sensor frame in N goes to userspace, and the rest are handed straight back to
-the ISP from a work item.
-- `G_PARM` reports `N/30`.
-- `ENUM_FRAMEINTERVALS` reports the matching `1/30`–`30/30` stepwise range.
-- `S_PARM` works mid-stream.
-
-Upstream programs the ISP's AE frame-rate window (2–30 fps) instead and returns
-`-EBUSY` while streaming. Whether that window changes the delivered rate is
-unmeasured here: it reads back `7672` (29.97 fps in Q8.8) when set to 30. A
-reported rate the stream does not match is what stalls GStreamer's
-`pipewiresrc`, so `S_PARM` does not use it until it is measured. The window is
-held at 30 fps.
-
-Upstream's `V4L2_CID_EXPOSURE_AUTO_PRIORITY`, which lowers the window minimum
-to 5 fps in dim light, is not carried. It would change the sensor rate under
-the decimator's fixed 30.
+`S_PARM` programs the ISP's AE frame-rate window and `exposure_dynamic_framerate`
+(`V4L2_CID_EXPOSURE_AUTO_PRIORITY`) lets its minimum fall to 5 fps, as upstream
+does. The one difference: `ENUM_FRAMEINTERVALS` reports the continuous 2–30 fps
+range `S_PARM` accepts, where upstream reports only 1/30.
 
 ## Cropping
 
@@ -232,8 +221,10 @@ replayed.
 - 57/57 applicable `v4l2-compliance` tests, `CREATE_BUFS` streaming included,
   with no warnings;
 - NV12 planes checked against YUYV;
-- decimation at divisors 1–30, within 2.7% apart from the divisor-1 reading
-  under "Open";
+- the AE frame-rate window: a 15 fps request delivers 15.00 fps with the
+  firmware reading back `3840`/`3840`; in dim light, exposure priority drops a
+  30 fps stream to about 15–18 fps (window `7672`/`1280`) while priority off
+  holds 29.97;
 - five runtime-PM cycles;
 - suspend while streaming, with the viewer continuing;
 - `STREAMOFF` on signal;
@@ -251,11 +242,7 @@ replayed.
 - Whether NV12 is native 4:2:0 or a downsample.
 - Visible effect of anti-banding, exposure mode and metering under controlled
   light.
-- Whether the AE frame-rate window can lower the delivered rate. One run
-  delivered a steady 27.66 fps at divisor 1 for about 9 s, against 29.97
-  elsewhere in the same run. AE lengthening exposure in dim light is the likely
-  cause; re-check in bright, steady light.
-- Per-frame spacing under decimation (only a coarse bunching check exists).
+- Per-frame spacing at reduced rates (only a coarse bunching check exists).
 - Reboot or kexec while streaming.
 - Recovery from a real firmware timeout.
 - Payloads for the removed controls. See

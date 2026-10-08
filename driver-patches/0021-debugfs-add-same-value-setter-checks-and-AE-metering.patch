@@ -1,4 +1,4 @@
-From 7f1d23caf96acff6ab34e353a8e29aba998550ae Mon Sep 17 00:00:00 2001
+From 8c39db803842cf707aa08e641006d92ef518c193 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 21/21] debugfs: add same-value setter checks and AE
@@ -328,10 +328,10 @@ index b10e415..db4ff9a 100644
  	dev_priv->debugfs = d;
  	fthd_debugfs_users++;
 diff --git a/fthd_isp.c b/fthd_isp.c
-index a501eb1..a930085 100644
+index a2abab8..14ff808 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
-@@ -1291,6 +1291,23 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
+@@ -1287,6 +1287,23 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
  	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
  }
  
@@ -355,7 +355,7 @@ index a501eb1..a930085 100644
  int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel,
  				      u16 *bias, u32 *tag)
  {
-@@ -1408,6 +1425,44 @@ int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
+@@ -1404,6 +1421,44 @@ int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
  	return 0;
  }
  
@@ -401,7 +401,7 @@ index a501eb1..a930085 100644
   * Sensor die temperature, returned exactly as the firmware reports it.
   *
 diff --git a/fthd_isp.h b/fthd_isp.h
-index fcc6ad9..b79c914 100644
+index 58cee72..5eea218 100644
 --- a/fthd_isp.h
 +++ b/fthd_isp.h
 @@ -690,6 +690,16 @@ struct isp_cmd_channel_ae_flicker_freq_set {
@@ -421,7 +421,7 @@ index fcc6ad9..b79c914 100644
  struct isp_cmd_channel_ae_bias_get {
  	u32 channel;
  	u16 bias;
-@@ -848,12 +858,16 @@ extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_pri
+@@ -849,12 +859,16 @@ extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_pri
  extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
  extern int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv, int channel, u8 *mode);
  extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);

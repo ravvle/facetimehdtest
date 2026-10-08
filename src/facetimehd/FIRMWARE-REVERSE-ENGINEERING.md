@@ -336,15 +336,12 @@ against it. This is what justifies exposing it as the read-only
 `awb_cct_estimate` V4L2 control; cross-model confirmation is still open, which
 is why the CID is driver-private.
 
-**The frame-rate window is 29.97 fps in Q8.8, and it is pinned.** `7672 / 256`
-is `29.96875`, and NTSC `30000/1001` truncates in Q8.8 to exactly `7672` — the
-rate the decimation measurements independently recorded for this sensor. Two
-things follow. The Q8.8 encoding, previously only "consistent with" the gain
-values, is corroborated on a quantity measured by an entirely different method.
-And minimum equal to maximum means the AE frame-rate window is clamped to the
-sensor's single rate, which is the readable reason behind the behavioural
-finding in DOWNSTREAM.md, "Frame rate": this window is not a usable
-rate control.
+**The frame-rate window is Q8.8 fps, and the sensor follows it.** At 30 fps
+both bounds read `7672`: `7672 / 256` is `29.96875`, the NTSC `30000/1001`
+truncated in Q8.8 and the rate measured at the stream. A 15 fps request reads
+back `3840`/`3840` and delivers 15.00 fps, and with exposure priority the
+minimum reads `1280` (5 fps) and dim light slows the stream below 30. The Q8.8
+encoding is therefore corroborated on a quantity measured directly.
 
 **AWB second gain is not a live measurement.** All three words read exactly
 `4096` while the CCT estimate reported `2785` — markedly warm light, in which a

@@ -1,4 +1,4 @@
-From c1c6961a47bb590c9de01d9e62aec7590553bae1 Mon Sep 17 00:00:00 2001
+From f2fefb75866a7e12c30ab0819e06b856a16c00b4 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 16/21] pci: symmetric bring-up and teardown, with runtime
@@ -22,9 +22,9 @@ and errors the queue.
  fthd_drv.h    |  47 +++++-
  fthd_hw.c     |   9 +-
  fthd_isp.c    |  23 ++-
- fthd_v4l2.c   | 126 +++++++++++++--
+ fthd_v4l2.c   | 138 +++++++++++++---
  fthd_v4l2.h   |   1 +
- 7 files changed, 543 insertions(+), 100 deletions(-)
+ 7 files changed, 543 insertions(+), 112 deletions(-)
 
 diff --git a/fthd_buffer.c b/fthd_buffer.c
 index 03cf4cc..278aa22 100644
@@ -39,7 +39,7 @@ index 03cf4cc..278aa22 100644
  
  int fthd_buffer_init(struct fthd_private *dev_priv)
 diff --git a/fthd_drv.c b/fthd_drv.c
-index b89c533..33d2278 100644
+index 9e20a39..a9c7d8c 100644
 --- a/fthd_drv.c
 +++ b/fthd_drv.c
 @@ -13,6 +13,8 @@
@@ -375,7 +375,7 @@ index b89c533..33d2278 100644
  static int fthd_pci_probe(struct pci_dev *pdev,
  			  const struct pci_device_id *entry)
  {
-@@ -494,23 +639,21 @@ static int fthd_pci_probe(struct pci_dev *pdev,
+@@ -494,24 +639,22 @@ static int fthd_pci_probe(struct pci_dev *pdev,
  		dev_err(&pdev->dev, "Failed to allocate memory\n");
  		return -ENOMEM;
  	}
@@ -384,6 +384,7 @@ index b89c533..33d2278 100644
  
  	dev_priv->ddr_model = 4;
  	dev_priv->ddr_speed = 450;
+ 	dev_priv->frame_rate = FTHD_FRAME_RATE_MAX;
  
  	spin_lock_init(&dev_priv->io_lock);
 -	mutex_init(&dev_priv->vb2_queue_lock);
@@ -402,7 +403,7 @@ index b89c533..33d2278 100644
  	ret = fthd_pci_init(dev_priv);
  	if (ret)
  		goto fail_work;
-@@ -537,9 +680,21 @@ static int fthd_pci_probe(struct pci_dev *pdev,
+@@ -538,9 +681,21 @@ static int fthd_pci_probe(struct pci_dev *pdev,
  		goto fail_v4l2;
  
  	/* One line per probe, carrying what the twenty-line bring-up banner
@@ -425,7 +426,7 @@ index b89c533..33d2278 100644
  	return 0;
  fail_v4l2:
  	fthd_v4l2_unregister(dev_priv);
-@@ -547,47 +702,166 @@ fail_firmware:
+@@ -548,47 +703,166 @@ fail_firmware:
  	fthd_stop_firmware(dev_priv);
  fail_hw:
  	fthd_hw_deinit(dev_priv);
@@ -609,7 +610,7 @@ index b89c533..33d2278 100644
  static const struct pci_device_id fthd_pci_id_table[] = {
  	{ PCI_DEVICE(0x14e4, 0x1570) },
  	{ 0, },
-@@ -597,11 +871,11 @@ static struct pci_driver fthd_pci_driver = {
+@@ -598,11 +872,11 @@ static struct pci_driver fthd_pci_driver = {
  	.name = KBUILD_MODNAME,
  	.probe = fthd_pci_probe,
  	.remove = fthd_pci_remove,
@@ -625,7 +626,7 @@ index b89c533..33d2278 100644
  };
  
 diff --git a/fthd_drv.h b/fthd_drv.h
-index 7070253..aaa6059 100644
+index 323ca1e..cbcb9a5 100644
 --- a/fthd_drv.h
 +++ b/fthd_drv.h
 @@ -11,9 +11,11 @@
@@ -640,7 +641,7 @@ index 7070253..aaa6059 100644
  #include <linux/version.h>
  #include <media/videobuf2-dma-sg.h>
  #include <media/v4l2-device.h>
-@@ -54,7 +56,8 @@ struct fthd_private {
+@@ -58,7 +60,8 @@ struct fthd_private {
  	struct v4l2_device v4l2_dev;
  	struct video_device *videodev;
  	struct mutex ioctl_lock;
@@ -650,7 +651,7 @@ index 7070253..aaa6059 100644
  	bool v4l2_registered;
  	/* lock for synchronizing with irq/workqueue */
  	spinlock_t io_lock;
-@@ -117,8 +120,6 @@ struct fthd_private {
+@@ -121,8 +124,6 @@ struct fthd_private {
  
  	struct vb2_queue vb2_queue;
  	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
@@ -659,8 +660,8 @@ index 7070253..aaa6059 100644
  	unsigned int protocol_errors;
  
  	struct v4l2_ctrl_handler v4l2_ctrl_handler;
-@@ -135,12 +136,50 @@ struct fthd_private {
- 	struct work_struct requeue_work;
+@@ -134,12 +135,50 @@ struct fthd_private {
+ 	int exposure_auto_priority;
  	unsigned int sequence;
  	u64 buffer_tag;
 +	/* Serialises the hardware up/down transitions and @suspended. Runtime
@@ -732,7 +733,7 @@ index f264c0c..a55d27c 100644
  	dev_dbg(&dev_priv->pdev->dev, "Enabling interrupts\n");
  	fthd_irq_enable(dev_priv);
 diff --git a/fthd_isp.c b/fthd_isp.c
-index 6b89370..b480b19 100644
+index f18bfd6..a14cee1 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
 @@ -36,6 +36,8 @@ int isp_mem_init(struct fthd_private *dev_priv)
@@ -767,7 +768,7 @@ index 6b89370..b480b19 100644
  	return 0;
  }
  
-@@ -1490,6 +1501,15 @@ int fthd_stop_channel(struct fthd_private *dev_priv, int channel)
+@@ -1506,6 +1517,15 @@ int fthd_stop_channel(struct fthd_private *dev_priv, int channel)
  	return fthd_isp_cmd_channel_temporal_filter_stop(dev_priv, 0);
  }
  
@@ -783,7 +784,7 @@ index 6b89370..b480b19 100644
  int isp_init(struct fthd_private *dev_priv)
  {
  	struct isp_mem_obj *fw_queue, *heap, *fw_args;
-@@ -1636,7 +1656,7 @@ int isp_init(struct fthd_private *dev_priv)
+@@ -1652,7 +1672,7 @@ int isp_init(struct fthd_private *dev_priv)
  		if (retries >= 1000) {
  			dev_err(&dev_priv->pdev->dev, "Init failed! No second int\n");
  			return -EIO;
@@ -792,7 +793,7 @@ index 6b89370..b480b19 100644
  
  		dev_dbg(&dev_priv->pdev->dev, "ISP second int after %dms\n",
  			(retries - 1) * 10);
-@@ -1666,7 +1686,6 @@ int isp_init(struct fthd_private *dev_priv)
+@@ -1682,7 +1702,6 @@ int isp_init(struct fthd_private *dev_priv)
  
  		if (retries >= 1000) {
  			dev_err(&dev_priv->pdev->dev, "Init failed! No magic value\n");
@@ -801,10 +802,10 @@ index 6b89370..b480b19 100644
  		}
  		dev_dbg(&dev_priv->pdev->dev, "magic value: %08x after %d ms\n", reg, (retries - 1) * 10);
 diff --git a/fthd_v4l2.c b/fthd_v4l2.c
-index 6577213..916401b 100644
+index 1ecf608..6877017 100644
 --- a/fthd_v4l2.c
 +++ b/fthd_v4l2.c
-@@ -618,6 +618,10 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -521,6 +521,10 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
  	dev_priv->protocol_errors = 0;
  	spin_unlock_irq(&dev_priv->buffer_lock);
  
@@ -815,7 +816,7 @@ index 6577213..916401b 100644
  	if (READ_ONCE(dev_priv->wedged)) {
  		ret = -EIO;
  		goto fail_buffers;
-@@ -677,6 +681,9 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
+@@ -580,6 +584,9 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
  	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
  	int ret;
  
@@ -825,7 +826,7 @@ index 6577213..916401b 100644
  	if (dev_priv->channel_running) {
  		dev_priv->channel_running = false;
  
-@@ -697,6 +704,48 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
+@@ -594,6 +601,44 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
  	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
  }
  
@@ -859,10 +860,6 @@ index 6577213..916401b 100644
 +				 "failed to stop firmware channel for suspend\n");
 +	}
 +
-+	/* Same reason as in fthd_stop_streaming(): no decimated buffer may be
-+	 * sent to an ISP that is about to lose power. */
-+	cancel_work_sync(&dev_priv->requeue_work);
-+
 +	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
 +
 +	for (i = 0; i < FTHD_BUFFERS; i++)
@@ -874,7 +871,7 @@ index 6577213..916401b 100644
  static const struct vb2_ops vb2_queue_ops = {
  	.queue_setup            = fthd_buffer_queue_setup,
  	.buf_prepare            = fthd_buffer_prepare,
-@@ -710,15 +759,38 @@ static const struct vb2_ops vb2_queue_ops = {
+@@ -607,15 +652,38 @@ static const struct vb2_ops vb2_queue_ops = {
  #endif
  };
  
@@ -915,7 +912,7 @@ index 6577213..916401b 100644
  	return ret;
  }
  
-@@ -728,7 +800,7 @@ static int fthd_v4l2_release(struct file *filp)
+@@ -625,7 +693,7 @@ static int fthd_v4l2_release(struct file *filp)
  	int ret;
  
  	ret = vb2_fop_release(filp);
@@ -924,7 +921,38 @@ index 6577213..916401b 100644
  
  	return ret;
  }
-@@ -1326,6 +1398,14 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
+@@ -848,7 +916,6 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
+ 	struct fthd_private *dev_priv = video_drvdata(filp);
+ 	struct v4l2_fract *tpf = &parm->parm.capture.timeperframe;
+ 	u64 rate = FTHD_FRAME_RATE_MAX;
+-	int ret;
+ 
+ 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+ 		return -EINVAL;
+@@ -857,18 +924,11 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
+ 			       tpf->numerator);
+ 	rate = clamp_t(u64, rate, FTHD_FRAME_RATE_MIN, FTHD_FRAME_RATE_MAX);
+ 
+-	ret = mutex_lock_interruptible(&dev_priv->vb2_queue_lock);
+-	if (ret)
+-		return ret;
+ 	/* Rate commands take effect at channel start. Do not promise a live change. */
+-	if (vb2_is_streaming(&dev_priv->vb2_queue)) {
+-		ret = -EBUSY;
+-	} else {
+-		WRITE_ONCE(dev_priv->frame_rate, (u32)rate);
+-		ret = fthd_v4l2_ioctl_g_parm(filp, priv, parm);
+-	}
+-	mutex_unlock(&dev_priv->vb2_queue_lock);
+-	return ret;
++	if (vb2_is_streaming(&dev_priv->vb2_queue))
++		return -EBUSY;
++	WRITE_ONCE(dev_priv->frame_rate, (u32)rate);
++	return fthd_v4l2_ioctl_g_parm(filp, priv, parm);
+ }
+ 
+ /*
+@@ -1207,6 +1267,14 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
  	.s_ctrl = fthd_s_ctrl,
  };
  
@@ -939,7 +967,7 @@ index 6577213..916401b 100644
  int fthd_v4l2_register(struct fthd_private *dev_priv)
  {
  	struct v4l2_device *v4l2_dev = &dev_priv->v4l2_dev;
-@@ -1352,6 +1432,13 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1225,6 +1293,13 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  		ret = -ENOMEM;
  		goto fail;
  	}
@@ -953,7 +981,7 @@ index 6577213..916401b 100644
  	dev_priv->videodev = vdev;
  
  	q = &dev_priv->vb2_queue;
-@@ -1361,16 +1448,17 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1234,16 +1309,17 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  	q->ops = &vb2_queue_ops;
  	q->mem_ops = &vb2_dma_sg_memops;
  	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
@@ -971,9 +999,9 @@ index 6577213..916401b 100644
 -		goto fail;
 +		goto fail_vdev_alloc;
  
- 	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 7);
+ 	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
  	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-@@ -1396,16 +1484,18 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1271,16 +1347,18 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  
  	if (dev_priv->v4l2_ctrl_handler.error) {
  		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");
@@ -994,7 +1022,7 @@ index 6577213..916401b 100644
  	vdev->ctrl_handler = &dev_priv->v4l2_ctrl_handler;
  	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
  			    V4L2_CAP_STREAMING;
-@@ -1424,24 +1514,38 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1299,24 +1377,38 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  
  	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
  	if (ret) {

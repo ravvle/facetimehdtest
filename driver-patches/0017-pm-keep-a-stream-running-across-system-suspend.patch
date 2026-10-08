@@ -1,4 +1,4 @@
-From 94c6bc8e584a5e94c6fd1260dfbb44fde419592b Mon Sep 17 00:00:00 2001
+From a8ede09c101db1d5da8df584d0dc340e1b244939 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 17/21] pm: keep a stream running across system suspend
@@ -13,12 +13,12 @@ before.
 ---
  fthd_drv.c  |  39 +++++++++--
  fthd_drv.h  |  12 ++++
- fthd_v4l2.c | 196 +++++++++++++++++++++++++++++++++++++++++++++++-----
+ fthd_v4l2.c | 187 +++++++++++++++++++++++++++++++++++++++++++++++-----
  fthd_v4l2.h |   3 +-
- 4 files changed, 225 insertions(+), 25 deletions(-)
+ 4 files changed, 220 insertions(+), 21 deletions(-)
 
 diff --git a/fthd_drv.c b/fthd_drv.c
-index 33d2278..c77dcfd 100644
+index a9c7d8c..e4a8ae5 100644
 --- a/fthd_drv.c
 +++ b/fthd_drv.c
 @@ -396,6 +396,8 @@ static void fthd_stop_firmware(struct fthd_private *dev_priv)
@@ -39,7 +39,7 @@ index 33d2278..c77dcfd 100644
  
  	mutex_lock(&dev_priv->pm_lock);
  	fthd_pm_down(dev_priv);
-@@ -768,6 +770,20 @@ static int fthd_runtime_resume(struct device *dev)
+@@ -769,6 +771,20 @@ static int fthd_runtime_resume(struct device *dev)
  	return ret;
  }
  
@@ -60,7 +60,7 @@ index 33d2278..c77dcfd 100644
  /*
   * System sleep.  Same hardware transition as the runtime path, but a system
   * suspend can arrive with the device open, so it takes the V4L2 ioctl lock to
-@@ -779,8 +795,8 @@ static int fthd_runtime_resume(struct device *dev)
+@@ -780,8 +796,8 @@ static int fthd_runtime_resume(struct device *dev)
   * returns -EBUSY is just deferred, while an error here aborts the entire sleep
   * transition and leaves the machine awake.  A camera left streaming - by an
   * app the user forgot about, or one that had not noticed the lid closing - is
@@ -71,7 +71,7 @@ index 33d2278..c77dcfd 100644
   */
  static int __maybe_unused fthd_suspend(struct device *dev)
  {
-@@ -793,7 +809,7 @@ static int __maybe_unused fthd_suspend(struct device *dev)
+@@ -794,7 +810,7 @@ static int __maybe_unused fthd_suspend(struct device *dev)
  	mutex_lock(&dev_priv->ioctl_lock);
  
  	if (vb2_is_busy(&dev_priv->vb2_queue))
@@ -80,7 +80,7 @@ index 33d2278..c77dcfd 100644
  
  	/* The force helpers use the runtime-PM usage count to remember whether
  	 * the camera was actually in use.  In particular, an idle camera still
-@@ -801,8 +817,13 @@ static int __maybe_unused fthd_suspend(struct device *dev)
+@@ -802,8 +818,13 @@ static int __maybe_unused fthd_suspend(struct device *dev)
  	 * needlessly reloading its firmware and immediately tearing it down. */
  	dev_priv->system_suspending = true;
  	ret = pm_runtime_force_suspend(dev);
@@ -95,7 +95,7 @@ index 33d2278..c77dcfd 100644
  
  	mutex_unlock(&dev_priv->ioctl_lock);
  	return ret;
-@@ -823,6 +844,14 @@ static int __maybe_unused fthd_resume(struct device *dev)
+@@ -824,6 +845,14 @@ static int __maybe_unused fthd_resume(struct device *dev)
  	ret = pm_runtime_force_resume(dev);
  	dev_priv->system_suspending = false;
  
@@ -111,10 +111,10 @@ index 33d2278..c77dcfd 100644
  	return ret;
  }
 diff --git a/fthd_drv.h b/fthd_drv.h
-index aaa6059..924da9b 100644
+index cbcb9a5..8e97339 100644
 --- a/fthd_drv.h
 +++ b/fthd_drv.h
-@@ -122,6 +122,18 @@ struct fthd_private {
+@@ -126,6 +126,18 @@ struct fthd_private {
  	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
  	unsigned int protocol_errors;
  
@@ -134,10 +134,10 @@ index aaa6059..924da9b 100644
  	/* True between a successful fthd_start_channel() and fthd_stop_channel().
  	 * The ISP only accepts the image-quality commands while the channel is
 diff --git a/fthd_v4l2.c b/fthd_v4l2.c
-index 916401b..7a9abee 100644
+index 6877017..c5999e6 100644
 --- a/fthd_v4l2.c
 +++ b/fthd_v4l2.c
-@@ -601,19 +601,25 @@ static void fthd_return_all_buffers(struct fthd_private *dev_priv,
+@@ -507,16 +507,25 @@ static void fthd_return_all_buffers(struct fthd_private *dev_priv,
  		vb2_buffer_done(buffers[i], state);
  }
  
@@ -164,14 +164,11 @@ index 916401b..7a9abee 100644
  
 -	pr_debug("count = %d\n", count);
 -	dev_priv->sequence = 0;
--	/* A new stream starts on a group boundary, so its first frame is always
--	 * delivered whatever rate was selected. */
--	dev_priv->frame_phase = 0;
 -
  	spin_lock_irq(&dev_priv->buffer_lock);
  	dev_priv->protocol_errors = 0;
  	spin_unlock_irq(&dev_priv->buffer_lock);
-@@ -662,7 +668,7 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -565,7 +574,7 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
  		}
  		submitted++;
  	}
@@ -180,7 +177,7 @@ index 916401b..7a9abee 100644
  		ret = -ENOBUFS;
  		goto fail_channel;
  	}
-@@ -676,14 +682,28 @@ fail_buffers:
+@@ -579,14 +588,25 @@ fail_buffers:
  	return ret;
  }
  
@@ -190,9 +187,6 @@ index 916401b..7a9abee 100644
 +
 +	pr_debug("count = %d\n", count);
 +	dev_priv->sequence = 0;
-+	/* A new stream starts on a group boundary, so its first frame is always
-+	 * delivered whatever rate was selected. */
-+	dev_priv->frame_phase = 0;
 +
 +	return fthd_stream_start(dev_priv, true);
 +}
@@ -212,7 +206,7 @@ index 916401b..7a9abee 100644
  	if (dev_priv->channel_running) {
  		dev_priv->channel_running = false;
  
-@@ -713,18 +733,30 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
+@@ -610,18 +630,30 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
   *
   * Everything the buffers own lives in ISP memory that fthd_pm_down() is about
   * to destroy, so it is all released here while the registers are still mapped.
@@ -248,14 +242,9 @@ index 916401b..7a9abee 100644
  	int i;
  
  	if (dev_priv->channel_running) {
-@@ -735,14 +767,140 @@ void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv)
+@@ -631,11 +663,136 @@ void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv)
+ 				 "failed to stop firmware channel for suspend\n");
  	}
- 
- 	/* Same reason as in fthd_stop_streaming(): no decimated buffer may be
--	 * sent to an ISP that is about to lose power. */
-+	 * sent to an ISP that is about to lose power, and none may still be in
-+	 * flight when the loop below detaches every slot. */
- 	cancel_work_sync(&dev_priv->requeue_work);
  
 -	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
 +	dev_priv->parked_count = 0;

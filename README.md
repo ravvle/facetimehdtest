@@ -20,8 +20,6 @@ upstream `master` today, it adds:
   into the same buffers.
 - **Runtime power management.** The camera powers down when nothing is using
   it.
-- **Frame rates delivered exactly**, by frame decimation, and changeable
-  mid-stream.
 - **Digital zoom and pan** through `VIDIOC_S_SELECTION`.
 - **NV12** as the default format, alongside YUYV. Each frame is a quarter
   smaller.

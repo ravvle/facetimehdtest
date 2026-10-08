@@ -8,6 +8,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/spinlock.h>
 #include <linux/version.h>
 #include <linux/videodev2.h>
@@ -74,26 +75,6 @@
  * chroma is not established - chroma means cannot tell - and nothing here
  * depends on it.
  */
-
-/* The only rate the sensor delivers.  Everything the driver reports is derived
- * from it, so G_PARM, S_PARM and ENUM_FRAMEINTERVALS cannot contradict each
- * other. */
-#define FTHD_FPS 30
-
-/*
- * Slower capture rates are produced by delivering one sensor frame in N and
- * handing the rest straight back to the ISP, so the rate the application asks
- * for is the rate it gets, exactly: the divisor is applied to frames the driver
- * has already received, so G_PARM cannot disagree with the stream.
- *
- * The ISP's AE frame-rate window (CISP_CMD_CH_AE_FRAME_RATE_{MIN,MAX}_SET) is
- * held at 30 fps by fthd_start_channel().  Whether lowering it lowers the
- * delivered rate has not been measured here, so S_PARM does not use it.
- *
- * The ISP still runs at full rate, so this saves bus and CPU work in the
- * application, not power in the camera.
- */
-#define FTHD_MAX_FPS_DIVISOR FTHD_FPS
 
 /*
  * True when the chroma plane lives at an offset inside the same buffer rather
@@ -444,7 +425,6 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 	struct vb2_buffer *vb = NULL;
 	struct vb2_v4l2_buffer *vbuf;
 	enum fthd_buffer_state invalid_state = BUF_FREE;
-	bool deliver = true;
 	unsigned long flags;
 	int i;
 
@@ -513,18 +493,7 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 		vb = ctx->vb;
 		dev_priv->protocol_errors = 0;
 
-		/* Frame-rate division: deliver the first frame of every group of
-		 * @fps_divisor and give the rest straight back.  The phase is
-		 * only ever touched here and at STREAMON, both under this lock. */
-		if (dev_priv->fps_divisor > 1) {
-			deliver = dev_priv->frame_phase == 0;
-			if (++dev_priv->frame_phase >= dev_priv->fps_divisor)
-				dev_priv->frame_phase = 0;
-		}
-
-		/* A decimated buffer stays the driver's, for the requeue worker. */
-		ctx->state = deliver ? BUF_ALLOC : BUF_DRV_QUEUED;
-		ctx->requeue = !deliver;
+		ctx->state = BUF_ALLOC;
 	} else {
 		invalid_state = ctx->state;
 	}
@@ -538,73 +507,11 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 		return;
 	}
 
-	if (!deliver) {
-		/* Decimated away.  The buffer never becomes visible to
-		 * userspace: it stays owned by the driver and goes back to the
-		 * ISP from the requeue worker.  The send cannot happen here -
-		 * this runs inside fthd_irq_work(), and fthd_send_h2t_buffer()
-		 * waits on the very channel whose completions that same work
-		 * item is what processes. */
-		schedule_work(&dev_priv->requeue_work);
-		return;
-	}
-
 	vbuf = to_vb2_v4l2_buffer(vb);
 	vbuf->sequence = dev_priv->sequence++;
 	vbuf->vb2_buf.timestamp = ktime_get_ns();
 	vbuf->field = V4L2_FIELD_NONE;
 	vb2_buffer_done(vb, VB2_BUF_STATE_DONE);
-}
-
-/*
- * Hand back the frames fthd_buffer_return_handler() decided not to deliver.
- *
- * Runs in its own work item purely for context: the return handler cannot send
- * to the h2t channel itself without deadlocking against the IRQ work it runs
- * inside.  Everything else mirrors the streaming branch of fthd_buffer_queue().
- */
-static void fthd_requeue_work(struct work_struct *work)
-{
-	struct fthd_private *dev_priv =
-		container_of(work, struct fthd_private, requeue_work);
-	unsigned long flags;
-	int i;
-
-	for (i = 0; i < FTHD_BUFFERS; i++) {
-		struct h2t_buf_ctx *ctx = &dev_priv->h2t_bufs[i];
-		bool send = false;
-
-		spin_lock_irqsave(&dev_priv->buffer_lock, flags);
-		/* channel_running going false means stop_streaming() or a
-		 * suspend is taking the buffers back; leaving this one
-		 * BUF_DRV_QUEUED is what lets fthd_return_all_buffers() find
-		 * it. */
-		if (ctx->requeue && ctx->state == BUF_DRV_QUEUED && ctx->vb &&
-		    dev_priv->channel_running) {
-			ctx->requeue = false;
-			ctx->dma_desc_list.field0 = 1;
-			ctx->state = BUF_HW_QUEUED;
-			send = true;
-		}
-		spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
-
-		if (!send)
-			continue;
-
-		if (fthd_send_h2t_buffer(dev_priv, ctx)) {
-			fthd_mark_firmware_wedged(dev_priv);
-			spin_lock_irqsave(&dev_priv->buffer_lock, flags);
-			if (ctx->state == BUF_HW_QUEUED) {
-				struct vb2_buffer *vb = ctx->vb;
-
-				ctx->state = BUF_ALLOC;
-				spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
-				vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
-				continue;
-			}
-			spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
-		}
-	}
 }
 
 static void fthd_return_all_buffers(struct fthd_private *dev_priv,
@@ -623,7 +530,6 @@ static void fthd_return_all_buffers(struct fthd_private *dev_priv,
 		     ctx->state == BUF_HW_QUEUED) && ctx->vb) {
 			buffers[count++] = ctx->vb;
 			ctx->state = BUF_ALLOC;
-			ctx->requeue = false;
 		}
 	}
 	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
@@ -719,9 +625,6 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	pr_debug("count = %d\n", count);
 	dev_priv->sequence = 0;
-	/* A new stream starts on a group boundary, so its first frame is always
-	 * delivered whatever rate was selected. */
-	dev_priv->frame_phase = 0;
 
 	return fthd_stream_start(dev_priv, true);
 }
@@ -743,12 +646,6 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
 			dev_warn(&dev_priv->pdev->dev,
 				 "failed to stop firmware channel: %d\n", ret);
 	}
-
-	/* Must happen after channel_running is cleared and before the buffers
-	 * are returned: a requeue worker that got past its state check would
-	 * otherwise hand vb2's buffer back to the ISP just as vb2 reclaims it.
-	 * The worker takes no lock this path holds. */
-	cancel_work_sync(&dev_priv->requeue_work);
 
 	/* stop_streaming must return every buffer owned by the driver.  Never
 	 * wait without a timeout for firmware that has already failed a command. */
@@ -796,11 +693,6 @@ void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park)
 			dev_warn(&dev_priv->pdev->dev,
 				 "failed to stop firmware channel for suspend\n");
 	}
-
-	/* Same reason as in fthd_stop_streaming(): no decimated buffer may be
-	 * sent to an ISP that is about to lose power, and none may still be in
-	 * flight when the loop below detaches every slot. */
-	cancel_work_sync(&dev_priv->requeue_work);
 
 	dev_priv->parked_count = 0;
 	dev_priv->parked_streaming = false;
@@ -1196,22 +1088,13 @@ static int fthd_v4l2_ioctl_g_parm(struct file *filp, void *priv,
 {
 	struct fthd_private *dev_priv = video_drvdata(filp);
 
-	/* Always the rate actually delivered: the sensor's fixed FTHD_FPS
-	 * divided by the decimation in force.  A reported rate the stream does
-	 * not match makes GStreamer's pipewiresrc compute negative frame
-	 * durations and stall.  Expressed as divisor/FTHD_FPS so that rates
-	 * like 7.5 fps stay exact. */
-	struct v4l2_fract timeperframe = {
-		.numerator = dev_priv->fps_divisor,
-		.denominator = FTHD_FPS,
-	};
-
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
 	parm->parm.capture.readbuffers = FTHD_BUFFERS;
 	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	parm->parm.capture.timeperframe = timeperframe;
+	parm->parm.capture.timeperframe.numerator = FTHD_FRAME_RATE_SCALE;
+	parm->parm.capture.timeperframe.denominator = READ_ONCE(dev_priv->frame_rate);
 	return 0;
 }
 
@@ -1220,38 +1103,19 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
 {
 	struct fthd_private *dev_priv = video_drvdata(filp);
 	struct v4l2_fract *tpf = &parm->parm.capture.timeperframe;
-	unsigned int divisor;
-	unsigned long flags;
+	u64 rate = FTHD_FRAME_RATE_MAX;
 
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
+	if (tpf->numerator && tpf->denominator)
+		rate = div_u64((u64)tpf->denominator * FTHD_FRAME_RATE_SCALE,
+			       tpf->numerator);
+	rate = clamp_t(u64, rate, FTHD_FRAME_RATE_MIN, FTHD_FRAME_RATE_MAX);
 
-	/* V4L2 spec: either field zero asks for the default rate. */
-	if (!tpf->numerator || !tpf->denominator) {
-		divisor = 1;
-	} else {
-		/* Round the requested interval to the nearest whole number of
-		 * sensor frames.  64-bit because a caller may legitimately pass
-		 * a large numerator to express a very slow rate. */
-		u64 frames = (u64)tpf->numerator * FTHD_FPS +
-			     tpf->denominator / 2;
-
-		do_div(frames, tpf->denominator);
-		if (frames < 1)
-			frames = 1;
-		if (frames > FTHD_MAX_FPS_DIVISOR)
-			frames = FTHD_MAX_FPS_DIVISOR;
-		divisor = frames;
-	}
-
-	/* Read by the buffer-return handler, which holds only this lock. */
-	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
-	dev_priv->fps_divisor = divisor;
-	dev_priv->frame_phase = 0;
-	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
-
-	/* Report back what was actually selected, which is what distinguishes
-	 * an accepted rate from a silently ignored one. */
+	/* Rate commands take effect at channel start. Do not promise a live change. */
+	if (vb2_is_streaming(&dev_priv->vb2_queue))
+		return -EBUSY;
+	WRITE_ONCE(dev_priv->frame_rate, (u32)rate);
 	return fthd_v4l2_ioctl_g_parm(filp, priv, parm);
 }
 
@@ -1468,17 +1332,15 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
 	    || interval->height > max_h)
 		return -EINVAL;
 
-	/* Stepwise, because the rates the driver can deliver are exactly the
-	 * sensor rate divided by a whole number of frames: k/FTHD_FPS for k in
-	 * 1..FTHD_MAX_FPS_DIVISOR.  A discrete list would either omit rates
-	 * S_PARM accepts or advertise ones it cannot hit exactly. */
-	interval->type = V4L2_FRMIVAL_TYPE_STEPWISE;
-	interval->stepwise.min.numerator = 1;
-	interval->stepwise.min.denominator = FTHD_FPS;
-	interval->stepwise.max.numerator = FTHD_MAX_FPS_DIVISOR;
-	interval->stepwise.max.denominator = FTHD_FPS;
+	/* Continuous over the range S_PARM accepts: FTHD_FRAME_RATE_MAX down
+	 * to FTHD_FRAME_RATE_MIN. */
+	interval->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
+	interval->stepwise.min.numerator = FTHD_FRAME_RATE_SCALE;
+	interval->stepwise.min.denominator = FTHD_FRAME_RATE_MAX;
+	interval->stepwise.max.numerator = FTHD_FRAME_RATE_SCALE;
+	interval->stepwise.max.denominator = FTHD_FRAME_RATE_MIN;
 	interval->stepwise.step.numerator = 1;
-	interval->stepwise.step.denominator = FTHD_FPS;
+	interval->stepwise.step.denominator = 1;
 
 	return 0;
 }
@@ -1614,6 +1476,12 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 		ret = fthd_isp_cmd_channel_ae(dev_priv, 0,
 				ctrl->val == V4L2_EXPOSURE_AUTO);
 		break;
+	case V4L2_CID_EXPOSURE_AUTO_PRIORITY:
+		ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0,
+							  fthd_isp_ae_frame_rate_min(dev_priv, ctrl->val));
+		if (!ret)
+			dev_priv->exposure_auto_priority = ctrl->val;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1660,14 +1528,6 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	struct vb2_queue *q;
 	int ret;
 
-	/* Before anything that can fail: the stop paths call
-	 * cancel_work_sync() on this unconditionally. */
-	INIT_WORK(&dev_priv->requeue_work, fthd_requeue_work);
-
-	/* Full rate until S_PARM asks for less. */
-	dev_priv->fps_divisor = 1;
-	dev_priv->frame_phase = 0;
-
 	ret = v4l2_device_register(&dev_priv->pdev->dev, v4l2_dev);
 	if (ret) {
 		dev_err(&dev_priv->pdev->dev, "v4l2_device_register: %d\n", ret);
@@ -1707,7 +1567,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	if (ret)
 		goto fail_vdev_alloc;
 
-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
+	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 9);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
@@ -1728,6 +1588,8 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
 			       V4L2_EXPOSURE_MANUAL, 0,
 			       V4L2_EXPOSURE_AUTO);
+	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+			  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
 	/* Read-only: registering it adds a GET the application can ask for and
 	 * no SET the framework can replay. */
 	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,

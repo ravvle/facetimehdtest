@@ -1,4 +1,4 @@
-From 9e0826071e97a11adeb023632250c5867a023687 Mon Sep 17 00:00:00 2001
+From 83291db1a261c5d3943a17d92812524591181c09 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 19/21] debugfs: expose confirmed firmware readbacks
@@ -298,10 +298,10 @@ index 5855242..b10e415 100644
  	dev_priv->debugfs = d;
  	fthd_debugfs_users++;
 diff --git a/fthd_isp.c b/fthd_isp.c
-index b480b19..a501eb1 100644
+index a14cee1..a2abab8 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
-@@ -1252,6 +1252,25 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
+@@ -1248,6 +1248,25 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
  	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_SET, &cmd, sizeof(cmd), &len);
  }
  
@@ -327,7 +327,7 @@ index b480b19..a501eb1 100644
  /*
   * Anti-banding.  CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET is one of the
   * Apple-private opcodes. Firmware reads one word at command offset +0x0c,
-@@ -1272,6 +1291,153 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
+@@ -1268,6 +1287,153 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
  	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
  }
  
@@ -482,7 +482,7 @@ index b480b19..a501eb1 100644
  {
  	struct isp_cmd_channel_brightness_set cmd;
 diff --git a/fthd_isp.h b/fthd_isp.h
-index efc27c2..fcc6ad9 100644
+index 4e12534..58cee72 100644
 --- a/fthd_isp.h
 +++ b/fthd_isp.h
 @@ -681,6 +681,79 @@ struct isp_cmd_channel_ae_flicker_freq_set {
@@ -565,7 +565,7 @@ index efc27c2..fcc6ad9 100644
  struct isp_cmd_channel_start {
  	u32 channel;
  };
-@@ -773,7 +846,22 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
+@@ -774,7 +847,22 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
  extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_priv, int channel);
  extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
  extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);

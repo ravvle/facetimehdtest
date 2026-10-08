@@ -1,0 +1,36 @@
+From 700aecc44737073f9de565fb12d01a4eeebbda1e Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 15/21] v4l2: enumerate the frame-interval range S_PARM accepts
+
+S_PARM accepts any rate from 2 to 30 fps and programs the ISP's AE
+frame-rate window with it, but ENUM_FRAMEINTERVALS advertised only
+1/30. Report the continuous range instead, so applications can see the
+rates they are allowed to request.
+---
+ fthd_v4l2.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 3733b26..1ecf608 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -1084,9 +1084,15 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
+ 	    || interval->height > max_h)
+ 		return -EINVAL;
+ 
+-	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+-	interval->discrete.numerator = 1;
+-	interval->discrete.denominator = 30;
++	/* Continuous over the range S_PARM accepts: FTHD_FRAME_RATE_MAX down
++	 * to FTHD_FRAME_RATE_MIN. */
++	interval->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
++	interval->stepwise.min.numerator = FTHD_FRAME_RATE_SCALE;
++	interval->stepwise.min.denominator = FTHD_FRAME_RATE_MAX;
++	interval->stepwise.max.numerator = FTHD_FRAME_RATE_SCALE;
++	interval->stepwise.max.denominator = FTHD_FRAME_RATE_MIN;
++	interval->stepwise.step.numerator = 1;
++	interval->stepwise.step.denominator = 1;
+ 
+ 	return 0;
+ }

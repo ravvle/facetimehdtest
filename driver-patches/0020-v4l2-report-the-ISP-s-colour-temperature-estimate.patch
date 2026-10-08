@@ -1,4 +1,4 @@
-From bef62d756a0c1ad03d9b44fd08a17de89ffc8e76 Mon Sep 17 00:00:00 2001
+From 45f8525d41b366a9dcb43f5cf06321dcf7f1cce0 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 20/21] v4l2: report the ISP's colour-temperature estimate
@@ -13,10 +13,10 @@ An idle camera reports the last sampled value rather than powering up.
  1 file changed, 96 insertions(+), 3 deletions(-)
 
 diff --git a/fthd_v4l2.c b/fthd_v4l2.c
-index 7a9abee..5c6a2d5 100644
+index c5999e6..45ae69e 100644
 --- a/fthd_v4l2.c
 +++ b/fthd_v4l2.c
-@@ -30,6 +30,37 @@
+@@ -31,6 +31,37 @@
  #define FTHD_MIN_HEIGHT 240
  #define FTHD_PROTOCOL_ERROR_LIMIT 4
  
@@ -54,7 +54,7 @@ index 7a9abee..5c6a2d5 100644
  /*
   * The ISP's semi-planar output, format code 0, is NV12.  Measured on a
   * MacBookAir7,2: a width*height luma plane followed by exactly width*height/2
-@@ -1497,10 +1528,50 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
+@@ -1359,10 +1390,50 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
  	.vidioc_log_status      = v4l2_ctrl_log_status,
  };
  
@@ -107,7 +107,7 @@ index 7a9abee..5c6a2d5 100644
  }
  
  static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
-@@ -1556,6 +1627,24 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
+@@ -1424,6 +1495,24 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
  	.s_ctrl = fthd_s_ctrl,
  };
  
@@ -132,19 +132,19 @@ index 7a9abee..5c6a2d5 100644
  static void fthd_video_device_release(struct video_device *vdev)
  {
  	struct fthd_private *dev_priv = video_get_drvdata(vdev);
-@@ -1618,7 +1707,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1478,7 +1567,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  	if (ret)
  		goto fail_vdev_alloc;
  
--	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 7);
-+	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
+-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
++	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 9);
  	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
  			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
  	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-@@ -1639,6 +1728,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
- 			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
- 			       V4L2_EXPOSURE_MANUAL, 0,
+@@ -1501,6 +1590,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  			       V4L2_EXPOSURE_AUTO);
+ 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+ 			  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
 +	/* Read-only: registering it adds a GET the application can ask for and
 +	 * no SET the framework can replay. */
 +	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,

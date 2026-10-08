@@ -1034,10 +1034,6 @@ int fthd_isp_cmd_channel_streaming_mode(struct fthd_private *dev_priv, int chann
 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_STREAMING_MODE_SET, &cmd, sizeof(cmd), &len);
 }
 
-/* AE frame-rate window bound, in the ISP's Q8.8 fps units.  The sensor runs at
- * 29.97 fps and the firmware clamps to that, reading back 7672. */
-#define FTHD_AE_FRAME_RATE (30 * 256)
-
 int fthd_isp_cmd_channel_frame_rate_min(struct fthd_private *dev_priv, int channel, int rate)
 {
 	struct isp_cmd_channel_frame_rate_set cmd;
@@ -1577,6 +1573,24 @@ int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enab
 	return fthd_isp_cmd(dev_priv, op, &cmd, sizeof(cmd), &len);
 }
 
+/* Slowest frame rate the auto exposure may fall back to, in 1/256 fps units. */
+#define FTHD_AE_FPS_MIN		(5 * 256)
+
+/*
+ * The auto exposure gathers light by lengthening the exposure, which it can
+ * only do by slowing down. Give it room to do so down to FTHD_AE_FPS_MIN when
+ * the application allows a varying frame rate.
+ */
+int fthd_isp_ae_frame_rate_min(struct fthd_private *dev_priv, bool auto_priority)
+{
+	int rate = dev_priv->frame_rate;
+
+	if (auto_priority && rate > FTHD_AE_FPS_MIN)
+		rate = FTHD_AE_FPS_MIN;
+
+	return rate;
+}
+
 int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 {
 	struct v4l2_rect *crop = &dev_priv->fmt.crop;
@@ -1666,10 +1680,12 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_face_detection_start(dev_priv, 0);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0, FTHD_AE_FRAME_RATE);
+	/* The cached rate uses the ISP's 1/256 fps units. */
+	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0, dev_priv->frame_rate);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0, FTHD_AE_FRAME_RATE);
+	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0,
+						  fthd_isp_ae_frame_rate_min(dev_priv, dev_priv->exposure_auto_priority));
 	if (ret)
 		return ret;
 	ret = fthd_isp_cmd_channel_temporal_filter_start(dev_priv, 0);

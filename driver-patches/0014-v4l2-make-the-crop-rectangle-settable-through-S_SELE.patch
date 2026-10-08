@@ -1,4 +1,4 @@
-From 7090e6df1eabd99ea467fc8a5751746fe0228fcf Mon Sep 17 00:00:00 2001
+From 0c81f81b46307d5483ef9c429eaca9f65910386c Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 14/21] v4l2: make the crop rectangle settable through
@@ -22,10 +22,10 @@ the real sensor size is known.
  3 files changed, 168 insertions(+), 45 deletions(-)
 
 diff --git a/fthd_isp.c b/fthd_isp.c
-index 5ee0180..7a8d2bd 100644
+index 5aca60a..f18bfd6 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
-@@ -1343,8 +1343,8 @@ int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enab
+@@ -1361,8 +1361,8 @@ int fthd_isp_ae_frame_rate_min(struct fthd_private *dev_priv, bool auto_priority
  
  int fthd_start_channel(struct fthd_private *dev_priv, int channel)
  {
@@ -36,7 +36,7 @@ index 5ee0180..7a8d2bd 100644
  
  	ret = fthd_isp_cmd_channel_camera_config(dev_priv);
  	if (ret)
-@@ -1353,39 +1353,15 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+@@ -1371,39 +1371,15 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
  	if (ret)
  		return ret;
  
@@ -85,7 +85,7 @@ index 5ee0180..7a8d2bd 100644
  		return ret;
  
 diff --git a/fthd_v4l2.c b/fthd_v4l2.c
-index 1f2beb0..d680b04 100644
+index b7b6040..3733b26 100644
 --- a/fthd_v4l2.c
 +++ b/fthd_v4l2.c
 @@ -817,6 +817,12 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
@@ -282,7 +282,7 @@ index 1f2beb0..d680b04 100644
  	.vidioc_enum_framesizes = fthd_v4l2_ioctl_enum_framesizes,
  	.vidioc_enum_frameintervals = fthd_v4l2_ioctl_enum_frameintervals,
  
-@@ -1134,6 +1278,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1142,6 +1286,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  	dev_priv->fmt.fmt.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
  	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_NV12;
  	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);

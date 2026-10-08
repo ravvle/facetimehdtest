@@ -646,6 +646,7 @@ static int fthd_pci_probe(struct pci_dev *pdev,
 
 	dev_priv->ddr_model = 4;
 	dev_priv->ddr_speed = 450;
+	dev_priv->frame_rate = FTHD_FRAME_RATE_MAX;
 
 	spin_lock_init(&dev_priv->io_lock);
 	spin_lock_init(&dev_priv->buffer_lock);

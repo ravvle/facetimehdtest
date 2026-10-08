@@ -1,4 +1,4 @@
-From ba854244d2c6cb4c69eacb52fd27afac78f9b88e Mon Sep 17 00:00:00 2001
+From f088c28ba9b59d55bd0ef872be5fb4a6ee83c375 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
 Date: Thu, 8 Oct 2026 12:00:00 +1000
 Subject: [PATCH 13/21] v4l2: add NV12, and pass the ISP the real row stride
@@ -24,7 +24,7 @@ device node is registered.
  4 files changed, 115 insertions(+), 57 deletions(-)
 
 diff --git a/fthd_isp.c b/fthd_isp.c
-index e516ccf..5ee0180 100644
+index ce04a1e..5aca60a 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
 @@ -880,24 +880,31 @@ int fthd_isp_cmd_channel_crop_set(struct fthd_private *dev_priv, int channel,
@@ -64,7 +64,7 @@ index e516ccf..5ee0180 100644
  	*/
  	cmd.pixelformat = pixelformat;
  	cmd.unknown3 = 0;
-@@ -1386,19 +1393,27 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+@@ -1404,19 +1411,27 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
  	case V4L2_PIX_FMT_YUYV:
  		pixelformat = 1;
  		break;
@@ -97,7 +97,7 @@ index e516ccf..5ee0180 100644
  	if (ret)
  		return ret;
 diff --git a/fthd_isp.h b/fthd_isp.h
-index 982d338..efc27c2 100644
+index 804f78d..4e12534 100644
 --- a/fthd_isp.h
 +++ b/fthd_isp.h
 @@ -746,7 +746,8 @@ extern int fthd_isp_cmd_channel_stop(struct fthd_private *dev_priv);
@@ -111,7 +111,7 @@ index 982d338..efc27c2 100644
  extern int fthd_isp_cmd_channel_recycle_start(struct fthd_private *dev_priv, int channel);
  extern int fthd_isp_cmd_channel_camera_config_select(struct fthd_private *dev_priv, int channel, int config);
 diff --git a/fthd_v4l2.c b/fthd_v4l2.c
-index 559fce5..1f2beb0 100644
+index dc9a917..b7b6040 100644
 --- a/fthd_v4l2.c
 +++ b/fthd_v4l2.c
 @@ -31,6 +31,30 @@
@@ -315,7 +315,7 @@ index 559fce5..1f2beb0 100644
  	    || interval->height > max_h)
  		return -EINVAL;
  
-@@ -1083,20 +1127,19 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1091,20 +1135,19 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
  			    V4L2_CAP_STREAMING;
  	video_set_drvdata(vdev, dev_priv);

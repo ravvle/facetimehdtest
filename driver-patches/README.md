@@ -11,7 +11,7 @@ most intrusive:
 | 4–7 | PLL/DDR error propagation, MSI vectors, BAR bounds checks, DDR cleanup | small, local fixes |
 | 8–10 | firmware data validation, command-path hardening, scatterlist mapping | robustness |
 | 11 | buffer ownership and locking | streaming core |
-| 12–15 | anti-banding/exposure, NV12, settable crop, frame-rate decimation | V4L2 features |
+| 12–15 | anti-banding/exposure, NV12, settable crop, frame-interval range | V4L2 features |
 | 16–17 | lifecycle and runtime PM, streams surviving system suspend | power management |
 | 18–21 | debugfs references, firmware readbacks, colour-temperature control, setter tests | diagnostics |
 
