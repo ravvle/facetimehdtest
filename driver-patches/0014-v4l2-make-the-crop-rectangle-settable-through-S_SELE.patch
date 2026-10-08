@@ -1,0 +1,317 @@
+From 7090e6df1eabd99ea467fc8a5751746fe0228fcf Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 14/21] v4l2: make the crop rectangle settable through
+ S_SELECTION
+
+Implement S_SELECTION for V4L2_SEL_TGT_CROP and report it through
+G_SELECTION, giving digital zoom and pan. The default stays the largest
+centred window with the output's aspect ratio, and setting it again
+hands the crop back to the format.
+
+The firmware accepts a window that leaves the sensor and then delivers
+no frames until it is reloaded, so the origin is clamped to keep the
+rectangle on the array, with left rounded down to a multiple of eight.
+The crop is never smaller than the output, S_SELECTION is refused while
+buffers exist, and the rectangle is re-fitted at channel start, where
+the real sensor size is known.
+---
+ fthd_isp.c  |  44 ++++----------
+ fthd_v4l2.c | 162 +++++++++++++++++++++++++++++++++++++++++++++++++---
+ fthd_v4l2.h |   7 +--
+ 3 files changed, 168 insertions(+), 45 deletions(-)
+
+diff --git a/fthd_isp.c b/fthd_isp.c
+index 5ee0180..7a8d2bd 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -1343,8 +1343,8 @@ int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enab
+ 
+ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+ {
+-	unsigned int sw, sh, ow, oh, cw, ch;
+-	int ret, x, y, pixelformat;
++	struct v4l2_rect *crop = &dev_priv->fmt.crop;
++	int ret, pixelformat;
+ 
+ 	ret = fthd_isp_cmd_channel_camera_config(dev_priv);
+ 	if (ret)
+@@ -1353,39 +1353,15 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Crop the largest centred window with the output's aspect ratio and
+-	 * let the ISP scale it down. The window and its offset are derived
+-	 * from the sensor's own reported size, so neither can exceed it.
+-	 */
+-	sw = dev_priv->sensor_width  ? : dev_priv->fmt.fmt.width;
+-	sh = dev_priv->sensor_height ? : dev_priv->fmt.fmt.height;
+-	ow = dev_priv->fmt.fmt.width;
+-	oh = dev_priv->fmt.fmt.height;
+-
+-	if (!ow || !oh) {
+-		cw = sw;
+-		ch = sh;
+-	} else if (ow * sh >= sw * oh) {
+-		/* output is wider than the sensor: keep the full width */
+-		cw = sw;
+-		ch = sw * oh / ow;
+-	} else {
+-		/* output is taller than the sensor: keep the full height */
+-		ch = sh;
+-		cw = sh * ow / oh;
+-	}
+-	/*
+-	 * An odd width at an odd offset makes the sensor interface fault on
+-	 * every frame, so keep the width even. That is enough: the offset
+-	 * then cannot be odd at the same time.
+-	 */
+-	cw = min(cw, sw) & ~1u;
+-	ch = min(ch, sh);
+-
+-	x = (sw - cw) / 2;
+-	y = (sh - ch) / 2;
++	/* Crop a rectangle of the sensor array and let the ISP scale it to the
++	 * negotiated output size.  The rectangle is whatever S_SELECTION set,
++	 * or else the largest centred window with the output's aspect ratio.
++	 * Re-fitted here because this is where the real sensor geometry (848x588
++	 * on the 12-inch MacBook, not 1280x720) is first known. */
++	fthd_v4l2_refresh_crop(dev_priv);
+ 
+-	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x, y, cw, ch);
++	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, crop->left, crop->top,
++					    crop->width, crop->height);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 1f2beb0..d680b04 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -817,6 +817,12 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
+ 
+ 	dev_priv->fmt.fmt = fmt->fmt.pix;
+ 
++	/* Re-derive the default crop for the new aspect ratio, or grow a chosen
++	 * one that is now smaller than the output: the ISP must never be asked
++	 * to upscale, and refusing the format instead would make S_FMT depend on
++	 * the order the two were set in. */
++	fthd_v4l2_refresh_crop(dev_priv);
++
+ 	return 0;
+ }
+ 
+@@ -865,9 +871,114 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
+ 	return ret;
+ }
+ 
+-/* Report the sensor area the scaler reads from. V4L2_SEL_TGT_CROP is left
+- * out: the window in use depends on the negotiated format.
++/*
++ * The ISP crops a rectangle of the sensor array and scales it to the negotiated
++ * format (see fthd_start_channel()).  Making that rectangle settable is digital
++ * zoom and pan: the same output size taken from a smaller part of the array.
++ *
++ * The crop is never smaller than the current output size, so the scaler is only
++ * ever asked to shrink - nothing here can confirm the ISP upscales.  And it is
++ * only settable while the channel is down, because the rectangle is programmed
++ * once during the channel-start sequence.
++ */
++static void fthd_v4l2_crop_bounds(struct fthd_private *dev_priv,
++				  struct v4l2_rect *r)
++{
++	r->left = 0;
++	r->top = 0;
++	r->width  = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
++	r->height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
++}
++
++/*
++ * The largest centred window with the output's aspect ratio, so a 4:3 format
++ * on the 16:9 array is cropped at the sides rather than squashed.  Rounding the
++ * width down to eight keeps it at least the (eight-aligned) output width.
++ */
++static void fthd_v4l2_default_crop(struct fthd_private *dev_priv,
++				   struct v4l2_rect *r)
++{
++	unsigned int ow = dev_priv->fmt.fmt.width;
++	unsigned int oh = dev_priv->fmt.fmt.height;
++	unsigned int sw, sh;
++
++	fthd_v4l2_crop_bounds(dev_priv, r);
++	sw = r->width;
++	sh = r->height;
++
++	if (ow && oh) {
++		if ((u64)ow * sh >= (u64)sw * oh)
++			r->height = sw * oh / ow;
++		else
++			r->width = sh * ow / oh;
++	}
++	r->width = round_down(r->width, 8);
++	r->left = (sw - r->width) / 2;
++	r->top  = (sh - r->height) / 2;
++}
++
++static void fthd_v4l2_get_crop(struct fthd_private *dev_priv,
++			       struct v4l2_rect *r)
++{
++	*r = dev_priv->fmt.crop;
++}
++
++/*
++ * Fit @r inside the sensor array, at least as large as the output format, and
++ * store it.  The firmware accepts a window that leaves the array and then
++ * delivers no frames until it is reloaded, so the origin is clamped to keep the
++ * whole rectangle on the sensor.  The width is a multiple of eight, which also
++ * rules out the odd-width-at-odd-offset window that faults the sensor
++ * interface.
+  */
++static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
++			       struct v4l2_rect *r)
++{
++	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
++	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
++	unsigned int min_w = max(FTHD_MIN_WIDTH, dev_priv->fmt.fmt.width);
++	unsigned int min_h = max(FTHD_MIN_HEIGHT, dev_priv->fmt.fmt.height);
++
++	/* The output can never exceed the array, so neither can the floor. */
++	min_w = min(min_w, max_w);
++	min_h = min(min_h, max_h);
++
++	r->width  = clamp_t(unsigned int, r->width,  min_w, max_w);
++	r->height = clamp_t(unsigned int, r->height, min_h, max_h);
++
++	r->width = ALIGN(r->width, 8);
++	if (r->width > max_w)
++		r->width = round_down(max_w, 8);
++
++	/* left and top are signed in struct v4l2_rect. */
++	if (r->left < 0)
++		r->left = 0;
++	if (r->top < 0)
++		r->top = 0;
++
++	r->left = round_down(min_t(unsigned int, r->left, max_w - r->width), 8);
++	r->top  = min_t(unsigned int, r->top, max_h - r->height);
++
++	dev_priv->fmt.crop = *r;
++}
++
++/*
++ * Re-fit the crop after something it depends on changed - a new output format,
++ * or the sensor geometry becoming known.  Until S_SELECTION sets one, the crop
++ * follows the format's aspect ratio.
++ */
++void fthd_v4l2_refresh_crop(struct fthd_private *dev_priv)
++{
++	struct v4l2_rect r;
++
++	if (dev_priv->fmt.crop_set)
++		fthd_v4l2_get_crop(dev_priv, &r);
++	else
++		fthd_v4l2_default_crop(dev_priv, &r);
++
++	fthd_v4l2_set_crop(dev_priv, &r);
++}
++
+ static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
+ 		struct v4l2_selection *sel)
+ {
+@@ -877,18 +988,50 @@ static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
+ 		return -EINVAL;
+ 
+ 	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++		fthd_v4l2_get_crop(dev_priv, &sel->r);
++		return 0;
+ 	case V4L2_SEL_TGT_CROP_DEFAULT:
++		fthd_v4l2_default_crop(dev_priv, &sel->r);
++		return 0;
+ 	case V4L2_SEL_TGT_CROP_BOUNDS:
+-		break;
++		fthd_v4l2_crop_bounds(dev_priv, &sel->r);
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
++}
++
++static int fthd_v4l2_ioctl_s_selection(struct file *filp, void *priv,
++		struct v4l2_selection *sel)
++{
++	struct fthd_private *dev_priv = video_drvdata(filp);
++	struct v4l2_rect def;
++
++	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++
++	if (sel->target != V4L2_SEL_TGT_CROP)
++		return -EINVAL;
+ 
+-	sel->r.left = 0;
+-	sel->r.top = 0;
+-	sel->r.width = dev_priv->sensor_width ? : FTHD_MAX_WIDTH;
+-	sel->r.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
++	/* The rectangle only reaches the firmware in the channel-start sequence,
++	 * so accepting one now would silently do nothing until the next
++	 * STREAMON.  Same reasoning as S_FMT refusing while buffers exist. */
++	if (vb2_is_busy(&dev_priv->vb2_queue))
++		return -EBUSY;
+ 
++	/* V4L2_SEL_FLAG_GE/_LE ask for a rectangle no smaller/larger than the
++	 * one given.  This driver rounds in both directions, so it cannot honour
++	 * either promise and must say so rather than return a rectangle that
++	 * breaks it. */
++	if (sel->flags & (V4L2_SEL_FLAG_GE | V4L2_SEL_FLAG_LE))
++		return -ERANGE;
++
++	/* Setting the CROP_DEFAULT rectangle hands the crop back to the format,
++	 * so it follows the aspect ratio of later S_FMT calls again. */
++	fthd_v4l2_set_crop(dev_priv, &sel->r);
++	fthd_v4l2_default_crop(dev_priv, &def);
++	dev_priv->fmt.crop_set = memcmp(&sel->r, &def, sizeof(def)) != 0;
+ 	return 0;
+ }
+ 
+@@ -983,6 +1126,7 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
+ 	.vidioc_g_parm          = fthd_v4l2_ioctl_g_parm,
+ 	.vidioc_s_parm          = fthd_v4l2_ioctl_s_parm,
+ 	.vidioc_g_selection     = fthd_v4l2_ioctl_g_selection,
++	.vidioc_s_selection     = fthd_v4l2_ioctl_s_selection,
+ 	.vidioc_enum_framesizes = fthd_v4l2_ioctl_enum_framesizes,
+ 	.vidioc_enum_frameintervals = fthd_v4l2_ioctl_enum_frameintervals,
+ 
+@@ -1134,6 +1278,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 	dev_priv->fmt.fmt.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+ 	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_NV12;
+ 	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);
++	/* After the format, because the crop's lower bound is the output size.
++	 * G_SELECTION is answerable from the first open either way; the channel
++	 * start re-fits this once the real sensor geometry is known. */
++	fthd_v4l2_refresh_crop(dev_priv);
+ 
+ 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+ 	if (ret) {
+diff --git a/fthd_v4l2.h b/fthd_v4l2.h
+index e3855e9..5307715 100644
+--- a/fthd_v4l2.h
++++ b/fthd_v4l2.h
+@@ -20,14 +20,13 @@ struct fthd_fmt {
+ 	struct v4l2_pix_format fmt;
+ 	const char *desc;
+ 	int range; /* CISP_COMMAND_CH_OUTPUT_CONFIG_SET */
+-	int x1; /* for CISP_CMD_CH_CROP_SET */
+-	int y1;
+-	int x2;
+-	int y2;
++	struct v4l2_rect crop;	/* for CISP_CMD_CH_CROP_SET */
++	bool crop_set;		/* chosen by S_SELECTION, not derived */
+ };
+ 
+ struct fthd_private;
+ extern int fthd_v4l2_register(struct fthd_private *dev_priv);
+ extern void fthd_v4l2_unregister(struct fthd_private *dev_priv);
++extern void fthd_v4l2_refresh_crop(struct fthd_private *dev_priv);
+ 
+ #endif

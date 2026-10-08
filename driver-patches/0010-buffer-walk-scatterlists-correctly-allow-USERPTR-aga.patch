@@ -1,0 +1,182 @@
+From 357531c3815c24ea894ce0fe6831fed0b101cedd Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 10/21] buffer: walk scatterlists correctly, allow USERPTR
+ again
+
+iommu_allocate_sgtable() walked the scatterlist with pointer
+arithmetic, which breaks on chained lists, and could not map a buffer
+whose first segment starts inside a page. Walk it with for_each_sg(),
+accept an unaligned start on the first segment only, record the page
+offset and include it in the DMA address, check the page arithmetic
+for overflow, and re-enable VB2_USERPTR.
+---
+ fthd_buffer.c | 85 ++++++++++++++++++++++++++++++---------------------
+ fthd_buffer.h |  9 +-----
+ fthd_v4l2.c   |  8 ++---
+ 3 files changed, 55 insertions(+), 47 deletions(-)
+
+diff --git a/fthd_buffer.c b/fthd_buffer.c
+index 543e0a3..03cf4cc 100644
+--- a/fthd_buffer.c
++++ b/fthd_buffer.c
+@@ -30,62 +30,79 @@ struct iommu_obj *iommu_allocate_sgtable(struct fthd_private *dev_priv, struct s
+ 	struct iommu_obj *obj;
+ 	struct resource *root = dev_priv->iommu;
+ 	struct scatterlist *sg;
+-	int ret, i, pos;
+-	int total_len = 0, dma_length;
++	resource_size_t total_pages = 0;
++	unsigned int page_offset = 0;
++	unsigned int pages, page;
++	size_t dma_length;
++	int ret, i;
++	u32 pos;
+ 	dma_addr_t dma_addr;
+-	
+-	for(i = 0; i < sgtable->nents; i++) {
+-		sg = sgtable->sgl + i;
+-
+-		/* The IOMMU descriptor holds a page number only, so a segment
+-		 * that does not start on a page boundary would be mapped from
+-		 * the start of its page and the hardware would write up to
+-		 * 4095 bytes in front of the buffer.
+-		 */
+-		if (sg->offset || (sg_dma_address(sg) & 0xfff)) {
+-			dev_err(&dev_priv->pdev->dev,
+-				"Buffer segment %d is not page aligned (offset %u), refusing\n",
+-				i, sg->offset);
++	u64 dma_page;
++
++	if (!sgtable || !sgtable->sgl || !sgtable->nents)
++		return NULL;
++
++	/* DMA scatterlists may be chained, so they must never be walked with
++	 * pointer arithmetic.  The S2 page table also cannot represent a gap in
++	 * the middle of a logical buffer: only the first segment may start at a
++	 * non-page-aligned address and only the final segment may end there. */
++	for_each_sg(sgtable->sgl, sg, sgtable->nents, i) {
++		dma_addr = sg_dma_address(sg);
++		dma_length = sg_dma_len(sg);
++		if (!dma_length)
++			return NULL;
++
++		if (!i)
++			page_offset = offset_in_page(dma_addr);
++		else if (offset_in_page(dma_addr))
+ 			return NULL;
+-		}
+ 
+-		total_len += sg_dma_len(sg);
++		if (i + 1 < sgtable->nents &&
++		    offset_in_page(dma_addr + dma_length))
++			return NULL;
++
++		pages = DIV_ROUND_UP(offset_in_page(dma_addr) + dma_length,
++				     PAGE_SIZE);
++		dma_page = dma_addr >> PAGE_SHIFT;
++		if (dma_page > U32_MAX || pages - 1 > U32_MAX - dma_page)
++			return NULL;
++		if (pages > resource_size(root) - total_pages)
++			return NULL;
++		total_pages += pages;
+ 	}
+-	
+-	if (!total_len)
++
++	if (!total_pages)
+ 		return NULL;
+ 
+-	total_len += 4095;
+-	total_len /= 4096;
+-	
+ 	obj = kzalloc(sizeof(struct iommu_obj), GFP_KERNEL);
+ 	if (!obj)
+ 		return NULL;
+ 
+ 	obj->base.name = "S2 IOMMU";
+-	ret = allocate_resource(root, &obj->base, total_len, root->start, root->end,
++	ret = allocate_resource(root, &obj->base, total_pages, root->start, root->end,
+ 				1, NULL, NULL);
+ 	if (ret) {
+ 		dev_err(&dev_priv->pdev->dev,
+-			"Failed to allocate resource (size: %d, start: %Ld, end: %Ld)\n",
+-			total_len, root->start, root->end);
++			"Failed to allocate resource (size: %pa, start: %pa, end: %pa)\n",
++			&total_pages, &root->start, &root->end);
+ 		kfree(obj);
+-		obj = NULL;
+ 		return NULL;
+ 	}
+ 
+ 	obj->offset = obj->base.start - root->start;
+-	obj->size = total_len;
++	obj->size = total_pages;
++	obj->page_offset = page_offset;
+ 
+ 	pos = 0x9000 + obj->offset * 4;
+-	for(i = 0; i < sgtable->nents; i++) {
+-		sg = sgtable->sgl + i;
++	for_each_sg(sgtable->sgl, sg, sgtable->nents, i) {
+ 		dma_addr = sg_dma_address(sg);
+-		dma_addr >>= 12;
+-		
+-		for(dma_length = 0; dma_length < sg_dma_len(sg); dma_length += 0x1000) {
+-		  //			pr_debug("IOMMU %08x -> %08llx (dma length %d)\n", pos, dma_addr, dma_length);
+-			FTHD_S2_REG_WRITE(dma_addr++, pos);
++		dma_length = sg_dma_len(sg);
++		pages = DIV_ROUND_UP(offset_in_page(dma_addr) + dma_length,
++				     PAGE_SIZE);
++		dma_page = dma_addr >> PAGE_SHIFT;
++
++		for (page = 0; page < pages; page++) {
++			FTHD_S2_REG_WRITE((u32)dma_page++, pos);
+ 			pos += 4;
+ 		}
+ 	}
+diff --git a/fthd_buffer.h b/fthd_buffer.h
+index f924074..0f22907 100644
+--- a/fthd_buffer.h
++++ b/fthd_buffer.h
+@@ -48,14 +48,7 @@ struct iommu_obj {
+ 	struct resource base;
+ 	int size;
+ 	int offset;
+-};
+-
+-struct fthd_plane {
+-	u8 *virt;
+-	u64 phys;
+-	dma_addr_t dma;
+-	int len;
+-	struct iommu_obj *iommu;
++	unsigned int page_offset;
+ };
+ 
+ struct h2t_buf_ctx {
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 9ed186b..5cf5528 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -245,7 +245,8 @@ static int fthd_buffer_prepare(struct vb2_buffer *vb)
+ 	dma_list->count = 1;
+ 	dma_list->desc[0].count = 1;
+ 	dma_list->desc[0].pool = 0x02;
+-	dma_list->desc[0].addr0 = (ctx->plane[0]->offset << 12) | 0xc0000000;
++	dma_list->desc[0].addr0 = (ctx->plane[0]->offset << PAGE_SHIFT) |
++		ctx->plane[0]->page_offset | 0xc0000000;
+ 
+ 	if (dev_priv->fmt.planes >= 2)
+ 		dma_list->desc[0].addr1 = (ctx->plane[1]->offset << 12) | 0xc0000000;
+@@ -806,10 +807,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 
+ 	q = &dev_priv->vb2_queue;
+ 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-	/* VB2_USERPTR not supported due to missing support for unaligned
+-	 * pointers.
+-	 */
+-	q->io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
++	q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_DMABUF | VB2_READ;
+ 	q->drv_priv = dev_priv;
+ 	q->ops = &vb2_queue_ops;
+ 	q->mem_ops = &vb2_dma_sg_memops;

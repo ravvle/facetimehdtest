@@ -210,7 +210,7 @@ show_status() {
     # request comes back empty; dmesg is the only place that is visible from,
     # and only when it can actually be read.
     if [ "$(id -u)" -eq 0 ] && have dmesg &&
-       dmesg 2>/dev/null | grep -q "no sensor calibration file"; then
+       dmesg 2>/dev/null | grep -q "set file .* is missing"; then
         bad "Kernel log: this machine's own calibration file is not installed"
         info "    its sensor is one extract-firmware.sh cannot fetch yet - see"
         info "    README.md, 'Firmware and sensor calibration'"

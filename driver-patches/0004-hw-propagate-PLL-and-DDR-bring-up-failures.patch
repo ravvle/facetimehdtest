@@ -1,44 +1,22 @@
-From 17405895785dc80e5bcf090338281436b0da70f6 Mon Sep 17 00:00:00 2001
+From 6d24edf416cb8bb407dde884b9f798785b9a12c1 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
-Date: Tue, 1 Sep 2026 12:00:00 +1000
-Subject: [PATCH 04/19] hw: propagate PLL and DDR bring-up failures
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 04/21] hw: propagate PLL and DDR bring-up failures
 
-fthd_hw_init() called fthd_hw_s2_preinit_ddr_controller_soc() and
-fthd_hw_s2_init_ddr_controller_soc() for effect and ignored what they
-returned, as did the pll_init() and ddr_rewrite_mode_regs() calls inside
-them. A machine whose PLL never locked therefore carried on to upload
-firmware to memory that was not working yet, and reported success.
-
-Return those errors to the caller.
-
-The PLL lock loop also had its condition inverted:
-
-	do {
-		reg = FTHD_S2_REG_READ(S2_PLL_CMU_STATUS);
-		udelay(10);
-		retries++;
-	} while (((reg & 0xff00) & S2_PLL_CMU_STATUS_LOCKED) && retries <= 10000);
-
-which spins *while* the lock bit is set and falls out the moment it is
-clear, so "S2 PLL is locked after N us" was printed on the strength of the
-PLL not being locked. Spin until the bit appears instead, and fail after the
-same 100 ms budget.
+Rewrite the S2 PLL lock wait as a bounded loop that checks the lock bit
+before sleeping, and return errors from the DDR preinit and mode-register
+rewrite steps instead of continuing on a controller that did not come up.
 ---
- fthd_hw.c | 38 ++++++++++++++++++++++++--------------
- 1 file changed, 24 insertions(+), 14 deletions(-)
+ fthd_hw.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
 
 diff --git a/fthd_hw.c b/fthd_hw.c
-index 2614dbb..dbcd409 100644
+index 0f0ed8b..b0cbc9f 100644
 --- a/fthd_hw.c
 +++ b/fthd_hw.c
-@@ -129,22 +129,23 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
- 
- 	fthd_hw_s2_pll_reset(dev_priv);
- 
--	dev_info(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
--		 ddr_speed);
-+	dev_dbg(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
-+		ddr_speed);
+@@ -132,13 +132,14 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
+ 	dev_dbg(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
+ 		ddr_speed);
  
 -	do {
 +	for (retries = 0; retries < 10000; retries++) {
@@ -47,36 +25,15 @@ index 2614dbb..dbcd409 100644
 +			break;
  		udelay(10);
 -		retries++;
--	} while (((reg & 0xff00) & S2_PLL_CMU_STATUS_LOCKED) && retries <= 10000);
+-	} while (!(reg & S2_PLL_CMU_STATUS_LOCKED) && retries <= 10000);
 +	}
  
 -	if (retries > 10000) {
--		dev_info(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
--			 reg);
 +	if (retries >= 10000) {
-+		dev_err(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
-+			reg);
+ 		dev_err(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
+ 			reg);
  		return -EINVAL;
- 	} else {
--		dev_info(&dev_priv->pdev->dev, "S2 PLL is locked after %d us\n",
--			 (retries * 10));
-+		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is locked after %d us\n",
-+			(retries * 10));
- 	}
- 
- 	reg = FTHD_S2_REG_READ(S2_PLL_STATUS_A8);
-@@ -278,7 +279,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
- 	FTHD_S2_REG_WRITE(reg & 0xfffffcff, S2_PLL_CTRL_9C);
- 	FTHD_S2_REG_WRITE(reg | 0x300, S2_PLL_CTRL_9C);
- 
--	fthd_hw_s2_pll_init(dev_priv, dev_priv->ddr_speed);
-+	ret = fthd_hw_s2_pll_init(dev_priv, dev_priv->ddr_speed);
-+	if (ret)
-+		return ret;
- 
- 	fthd_hw_ddr_phy_soft_reset(dev_priv);
- 
-@@ -598,7 +601,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+@@ -600,7 +601,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
  	FTHD_S2_REG_WRITE(val, S2_3208);
  	FTHD_S2_REG_WRITE(0x1040, S2_3200);
  
@@ -87,19 +44,15 @@ index 2614dbb..dbcd409 100644
  
  	FTHD_S2_REG_WRITE(0x20000, S2_DDR_2014);
  	FTHD_S2_REG_WRITE(1, S2_DDR_2008);
-@@ -654,8 +659,13 @@ int fthd_hw_init(struct fthd_private *dev_priv)
+@@ -656,7 +659,10 @@ int fthd_hw_init(struct fthd_private *dev_priv)
  	if (ret)
  		goto out;
  
 -	fthd_hw_s2_preinit_ddr_controller_soc(dev_priv);
--	fthd_hw_s2_init_ddr_controller_soc(dev_priv);
 +	ret = fthd_hw_s2_preinit_ddr_controller_soc(dev_priv);
 +	if (ret)
 +		goto out;
 +
-+	ret = fthd_hw_s2_init_ddr_controller_soc(dev_priv);
-+	if (ret)
-+		goto out;
- 
- /*
- 	dev_info(&dev_priv->pdev->dev,
+ 	ret = fthd_hw_s2_init_ddr_controller_soc(dev_priv);
+ 	if (ret)
+ 		goto out;

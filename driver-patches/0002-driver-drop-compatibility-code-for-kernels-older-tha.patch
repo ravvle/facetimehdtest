@@ -1,0 +1,161 @@
+From 78de8df07b33cf6e8017eeb8e383ac7adac06487 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 02/21] driver: drop compatibility code for kernels older than
+ 5.15
+
+Every LINUX_VERSION_CODE branch below 5.15 is removed: the 4.x vb2
+queue_setup() signatures and allocation contexts, the pre-4.2 format
+descriptions, the pci-aspm.h include, VFL_TYPE_GRABBER and the
+pre-5.18 coherent DMA mask call, which dma_set_mask_and_coherent()
+already covers. Branches for 6.8 and later are kept.
+---
+ fthd_drv.c  |  8 --------
+ fthd_drv.h  |  3 ---
+ fthd_v4l2.c | 35 +----------------------------------
+ 3 files changed, 1 insertion(+), 45 deletions(-)
+
+diff --git a/fthd_drv.c b/fthd_drv.c
+index 90cde4c..b102919 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -11,9 +11,6 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/version.h>
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+-#include <linux/pci-aspm.h>
+-#endif
+ #include <linux/io.h>
+ #include <linux/interrupt.h>
+ #include <linux/workqueue.h>
+@@ -394,11 +391,6 @@ static int fthd_pci_init(struct fthd_private *dev_priv)
+ 		goto fail_irq;
+ 
+ 	dev_info(&pdev->dev, "Setting %ubit DMA mask\n", dev_priv->dma_mask);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,18,0)
+-	pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(dev_priv->dma_mask));
+-#else
+-	dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(dev_priv->dma_mask));
+-#endif
+ 
+ 	pci_set_master(pdev);
+ 	pci_set_drvdata(pdev, dev_priv);
+diff --git a/fthd_drv.h b/fthd_drv.h
+index 4f006a0..a845dcf 100644
+--- a/fthd_drv.h
++++ b/fthd_drv.h
+@@ -118,9 +118,6 @@ struct fthd_private {
+ 	struct vb2_queue vb2_queue;
+ 	struct mutex vb2_queue_lock;
+ 	struct list_head buffer_queue;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+-	struct vb2_alloc_ctx *alloc_ctx;
+-#endif
+ 	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
+ 
+ 	struct v4l2_ctrl_handler v4l2_ctrl_handler;
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index a368d2f..4fbe6fa 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -29,28 +29,13 @@
+ #define FTHD_MAX_HEIGHT 720
+ #define FTHD_MIN_WIDTH 320
+ #define FTHD_MIN_HEIGHT 240
+-#define FTHD_NUM_FORMATS 2 /* NV16 is disabled for now */
+-
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
+-# define VFL_TYPE_VIDEO VFL_TYPE_GRABBER
+-#endif
+ 
+ static int fthd_buffer_queue_setup(
+     struct vb2_queue *vq,
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
+-    const struct v4l2_format *fmt,
+-#endif
+-#if !(LINUX_VERSION_CODE >= KERNEL_VERSION(4,5,0))
+-    const void *parg,
+-#endif
+     unsigned int *nbuffers,
+     unsigned int *nplanes,
+     unsigned int sizes[],
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
+     struct device *alloc_devs[]
+-#else
+-    void *alloc_ctxs[]
+-#endif
+ ) {
+ 
+ 	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
+@@ -124,11 +109,7 @@ static int fthd_buffer_queue_setup(
+ 			return -ENOMEM;
+ 	}
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+ 	alloc_devs[0] = &dev_priv->pdev->dev;
+-#else
+-	alloc_ctxs[0] = dev_priv->alloc_ctx;
+-#endif
+ 	return 0;
+ }
+ 
+@@ -455,16 +436,12 @@ static int fthd_v4l2_ioctl_querycap(struct file *filp, void *priv,
+ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
+ 				   struct v4l2_fmtdesc *fmt)
+ {
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
+ 	char *desc = NULL;
+-#endif
+ 
+ 	switch (fmt->index) {
+ 	case 0:
+ 		fmt->pixelformat = V4L2_PIX_FMT_YUYV;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
+ 		desc = "YUYV";
+-#endif
+ 		break;
+ 	/* YVYU is not advertised: the ISP firmware's output for that format is
+ 	 * broken (wrong/garbage chroma, renders green and pink). Apps that
+@@ -482,9 +459,7 @@ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
+ 	}
+ 
+ 	fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
+-	strncpy(fmt->description, desc, sizeof(fmt->description));
+-#endif
++	strscpy(fmt->description, desc, sizeof(fmt->description));
+ 
+ 	return 0;
+ }
+@@ -869,9 +844,6 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 		v4l2_ctrl_handler_free(&dev_priv->v4l2_ctrl_handler);
+ 		goto fail;
+ 	}
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+-	dev_priv->alloc_ctx = vb2_dma_sg_init_ctx(&dev_priv->pdev->dev);
+-#endif
+ 	vdev->v4l2_dev = v4l2_dev;
+ 	strscpy(vdev->name, "Apple Facetime HD", sizeof(vdev->name));
+ 	vdev->vfl_dir = VFL_DIR_RX;
+@@ -880,10 +852,8 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 	vdev->queue = q;
+ 	vdev->release = video_device_release;
+ 	vdev->ctrl_handler = &dev_priv->v4l2_ctrl_handler;
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
+ 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+ 			    V4L2_CAP_STREAMING;
+-#endif
+ 	video_set_drvdata(vdev, dev_priv);
+ 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+ 	if (ret) {
+@@ -912,9 +882,6 @@ void fthd_v4l2_unregister(struct fthd_private *dev_priv)
+ {
+ 
+ 	v4l2_ctrl_handler_free(&dev_priv->v4l2_ctrl_handler);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+-	vb2_dma_sg_cleanup_ctx(dev_priv->alloc_ctx);
+-#endif
+ 	video_unregister_device(dev_priv->videodev);
+ 	v4l2_device_unregister(&dev_priv->v4l2_dev);
+ }

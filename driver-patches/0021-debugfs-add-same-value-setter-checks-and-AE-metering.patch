@@ -1,54 +1,25 @@
-From 6078e713042d501c71d8e20fe245466c25154f8e Mon Sep 17 00:00:00 2001
+From 7f1d23caf96acff6ab34e353a8e29aba998550ae Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
-Date: Tue, 1 Sep 2026 12:00:00 +1000
-Subject: [PATCH 19/19] debugfs: add the same-value setter and metering harness
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 21/21] debugfs: add same-value setter checks and AE
+ metering-mode tests
 
-Identifying a firmware setter needs a way to exercise it that cannot itself
-be the thing that breaks the machine. Five root-write-only mode-0200 nodes
-do that: roundtrip_ae_bias, roundtrip_ae_metering_mode,
-roundtrip_ae_integration_time_max, roundtrip_ae_gain_cap and
-roundtrip_ae_gain_cap_min.
-
-They accept no numeric input - the only valid write is the literal word
-"same". Under ioctl_lock and an active-stream check, the kernel GETs the
-current value, SETs that exact value once, GETs again, and fails on
-mismatch. Userspace cannot choose an out-of-range value or make two gain
-limits cross, and nothing happens at module load, STREAMON or resume.
-
-test_ae_metering_mode and test_ae_metering_mode_restart are the one
-non-current-value experiment, deliberately limited to AE metering modes 0..3
-- the closed domain recovered from this firmware, whose mode 3 the
-established channel-start sequence already programs. They accept only the
-fixed tokens mode0 through mode3, reject numeric parsing, and verify the
-mode reads back exactly. The _restart variant stops AE, sets the mode,
-restarts AE and re-GETs, because the normal channel sequence programs
-metering before AE starts while the plain node mutates it with AE already
-running.
-
-The command wrappers this needs come with it, along with the recovered
-payload layouts for setters that stay unexposed - sharpness, test pattern,
-noise reduction, chroma suppression, DRC strength, manual integration time,
-manual gain and manual AWB CCT. Nominal GET slots for the first four are
-deliberately absent: this firmware's dispatcher routes those opcodes to its
-unsupported-command block even though the names exist in the recovered enum,
-so every image-processing setter it implements is write-only, with no way to
-restore a default except by reloading firmware. That is exactly why none of
-them is wired to a control.
-
-All of this is scaffolding, not ABI: no V4L2 control is registered and
-nothing is replayed. Remove it or keep it debug-only once the command
-semantics are established.
+Add root-only write-only files that, on the token "same", read an AE
+parameter, write the identical value back and read it again, and files
+that set AE metering modes 0-3 by fixed token and verify the readback.
+They exist to validate setter payloads without choosing values; none
+is exposed through V4L2 or touched by stream setup.
 ---
- fthd_debugfs.c | 286 +++++++++++++++++++++++++++++++++++++++++++++++++
- fthd_isp.c     | 160 +++++++++++++++++++++++++++
- fthd_isp.h     |  60 +++++++++++
- 3 files changed, 506 insertions(+)
+ fthd_debugfs.c | 287 +++++++++++++++++++++++++++++++++++++++++++++++++
+ fthd_isp.c     |  55 ++++++++++
+ fthd_isp.h     |  14 +++
+ 3 files changed, 356 insertions(+)
 
 diff --git a/fthd_debugfs.c b/fthd_debugfs.c
-index da103cb..db4ff9a 100644
+index b10e415..db4ff9a 100644
 --- a/fthd_debugfs.c
 +++ b/fthd_debugfs.c
-@@ -257,6 +257,13 @@ enum fthd_fw_readback {
+@@ -257,6 +257,14 @@ enum fthd_fw_readback {
  	FTHD_FW_CROP,
  };
  
@@ -59,10 +30,11 @@ index da103cb..db4ff9a 100644
 +	FTHD_FW_ROUNDTRIP_AE_GAIN_CAP,
 +	FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN,
 +};
- 
++
  /*
   * These files are deliberately unlike the ring-state diagnostics above.
-@@ -451,6 +458,271 @@ FTHD_FW_READBACK_SHOW(seq_crop_raw_read, FTHD_FW_CROP);
+  * Reading one sends exactly one statically whitelisted firmware GET.  Requiring
+@@ -450,6 +458,271 @@ FTHD_FW_READBACK_SHOW(seq_crop_raw_read, FTHD_FW_CROP);
  
  #undef FTHD_FW_READBACK_SHOW
  
@@ -334,7 +306,7 @@ index da103cb..db4ff9a 100644
  static int fthd_debugfs_seq_open(struct inode *inode, struct file *file,
  				 int (*show)(struct seq_file *, void *))
  {
-@@ -597,6 +869,20 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
+@@ -596,6 +869,20 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
  			    &seq_awb_2nd_gain_raw_read_fops);
  	debugfs_create_file("crop_raw", 0400, d, dev_priv,
  			    &seq_crop_raw_read_fops);
@@ -356,10 +328,34 @@ index da103cb..db4ff9a 100644
  	dev_priv->debugfs = d;
  	fthd_debugfs_users++;
 diff --git a/fthd_isp.c b/fthd_isp.c
-index 93b388b..d8a14a6 100644
+index a501eb1..a930085 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
-@@ -1427,6 +1427,166 @@ int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
+@@ -1291,6 +1291,23 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
+ 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
+ }
+ 
++/* Not exposed to userspace: encoding and tag semantics are still unknown. */
++int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv,
++					  int channel, u16 bias, u32 tag)
++{
++	struct isp_cmd_channel_ae_bias_set cmd;
++	int len;
++
++	pr_debug("set ae bias raw %u tag %u\n", bias, tag);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.bias = bias;
++	cmd.tag = tag;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_SET, &cmd, sizeof(cmd), &len);
++}
++
+ int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel,
+ 				      u16 *bias, u32 *tag)
+ {
+@@ -1408,6 +1425,44 @@ int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
  	return 0;
  }
  
@@ -401,193 +397,35 @@ index 93b388b..d8a14a6 100644
 +			channel, value);
 +}
 +
-+int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel,
-+						 unsigned int usec)
-+{
-+	struct isp_cmd_channel_ae_integration_time_set cmd;
-+	int len;
-+
-+	pr_debug("set integration time raw %u\n", usec);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.time = usec;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_INTEGRATION_TIME_SET, &cmd, sizeof(cmd), &len);
-+}
-+
-+/* Not exposed: using two AE caps as a manual-gain control is unvalidated. */
-+int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel,
-+				     unsigned int gain)
-+{
-+	int ret;
-+
-+	pr_debug("set gain %u\n", gain);
-+
-+	ret = fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(dev_priv, channel,
-+							    gain);
-+	if (ret)
-+		return ret;
-+
-+	return fthd_isp_cmd_channel_ae_gain_cap_set_raw(dev_priv, channel,
-+							gain);
-+}
-+
-+int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel,
-+					unsigned int cct)
-+{
-+	struct isp_cmd_channel_awb_cct_manual cmd;
-+	int len;
-+
-+	pr_debug("set awb cct raw %u\n", cct);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.cct = cct;
-+	cmd.tag = 0;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_CCT_MANUAL, &cmd, sizeof(cmd), &len);
-+}
-+
-+int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness)
-+{
-+	struct isp_cmd_channel_sharpness_set cmd;
-+	int len;
-+
-+	pr_debug("set sharpness %d\n", sharpness);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.sharpness = sharpness;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SHARPNESS_SET, &cmd, sizeof(cmd), &len);
-+}
-+
-+int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern)
-+{
-+	struct isp_cmd_channel_test_pattern_config cmd;
-+	int len;
-+
-+	pr_debug("set test pattern %d\n", pattern);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.pattern = pattern;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEST_PATTERN_CONFIG, &cmd, sizeof(cmd), &len);
-+}
-+
-+int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength)
-+{
-+	struct isp_cmd_channel_noise_reduction_set cmd;
-+	int len;
-+
-+	pr_debug("set noise reduction %d\n", strength);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.strength = strength;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_NOISE_REDUCTION_SET, &cmd, sizeof(cmd), &len);
-+}
-+
-+int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength)
-+{
-+	struct isp_cmd_channel_chroma_suppression_set cmd;
-+	int len;
-+
-+	pr_debug("set chroma suppression %d\n", strength);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.field0 = strength;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CHROMA_SUPPRESSION_SET, &cmd, sizeof(cmd), &len);
-+}
-+
-+/*
-+ * DRC strength.  fthd_start_channel() issues CISP_CMD_CH_DRC_START, which turns
-+ * the block on; this is the separate opcode that says how hard it works.
-+ */
-+int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength)
-+{
-+	struct isp_cmd_channel_drc_set cmd;
-+	int len;
-+
-+	pr_debug("set drc strength %d\n", strength);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.strength = strength;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_DRC_SET, &cmd, sizeof(cmd), &len);
-+}
-+
  /*
   * Sensor die temperature, returned exactly as the firmware reports it.
   *
 diff --git a/fthd_isp.h b/fthd_isp.h
-index 66043af..3ccf9b9 100644
+index fcc6ad9..b79c914 100644
 --- a/fthd_isp.h
 +++ b/fthd_isp.h
-@@ -747,6 +747,55 @@ struct isp_cmd_channel_ae_metering_mode_get {
- 	u8 reserved[3];
- };
+@@ -690,6 +690,16 @@ struct isp_cmd_channel_ae_flicker_freq_set {
+  * FIRMWARE-REVERSE-ENGINEERING.md.
+  */
  
-+/* Manual sensor integration time. The wire width is proven; units are not. */
-+struct isp_cmd_channel_ae_integration_time_set {
++/* Firmware reads a 16-bit value and a 32-bit tag. The encoding and tag
++ * semantics are not known; see FIRMWARE-REVERSE-ENGINEERING.md. */
++struct isp_cmd_channel_ae_bias_set {
 +	u32 channel;
-+	u32 time;
-+};
-+
-+/* Firmware consumes both words after the channel. The first appears to be CCT
-+ * and the second is likely a tag, but neither semantic is yet an ABI. */
-+struct isp_cmd_channel_awb_cct_manual {
-+	u32 channel;
-+	u32 cct;
++	u16 bias;
++	u16 reserved;
 +	u32 tag;
 +};
 +
-+struct isp_cmd_channel_sharpness_set {
-+	u32 channel;
-+	u8 sharpness;
-+	u8 reserved[3];
-+};
-+
-+struct isp_cmd_channel_test_pattern_config {
-+	u32 channel;
-+	u16 unknown;
-+	u16 pattern;
-+};
-+
-+/* Spatial noise-reduction byte. */
-+struct isp_cmd_channel_noise_reduction_set {
-+	u32 channel;
-+	u8 strength;
-+	u8 reserved[3];
-+};
-+
-+/* Firmware consumes three distinct bytes. Their meanings are unknown, so this
-+ * structure must not be exposed as one generic strength control. */
-+struct isp_cmd_channel_chroma_suppression_set {
-+	u32 channel;
-+	u8 field0;
-+	u8 field1;
-+	u8 field2;
-+};
-+
-+/* Dynamic-range-compression byte. */
-+struct isp_cmd_channel_drc_set {
-+	u32 channel;
-+	u8 strength;
-+	u8 reserved[3];
-+};
-+
- /* Sensor die temperature.  A GET: @temperature is written by the firmware.
-  * The scale is not documented; see fthd_isp_cmd_channel_sensor_temperature()
-  * for how the driver avoids having to guess one. */
-@@ -862,17 +911,28 @@ extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int c
- extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
++/* The corresponding GET writes the same bias/tag pair after the channel. */
+ struct isp_cmd_channel_ae_bias_get {
+ 	u32 channel;
+ 	u16 bias;
+@@ -848,12 +858,16 @@ extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_pri
+ extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
+ extern int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv, int channel, u8 *mode);
+ extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
++extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
  extern int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel, u16 *bias, u32 *tag);
  extern int fthd_isp_cmd_channel_ae_gain_cap_get(struct fthd_private *dev_priv, int channel, u32 *value);
 +extern int fthd_isp_cmd_channel_ae_gain_cap_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
@@ -599,19 +437,4 @@ index 66043af..3ccf9b9 100644
 +extern int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
  extern int fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
  extern int fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
-+extern int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel, unsigned int usec);
-+extern int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel, unsigned int gain);
  extern int fthd_isp_cmd_channel_awb_cct_get(struct fthd_private *dev_priv, int channel, u32 *value);
- extern int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv, int channel, u32 gain[3]);
- extern int fthd_isp_cmd_channel_ae_frame_rate_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
- extern int fthd_isp_cmd_channel_ae_frame_rate_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
- extern int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel, u32 rect1[4], u32 rect2[4]);
-+extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel, unsigned int cct);
-+extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
-+extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);
-+extern int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength);
-+extern int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength);
-+extern int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength);
- extern int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw);
- extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
- extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);

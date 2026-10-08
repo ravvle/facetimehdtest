@@ -1,59 +1,32 @@
-From 9b4941b72f6a6149ea19ea1fa519928b63a635a8 Mon Sep 17 00:00:00 2001
+From e1f560bf1e24ebbd6309fde8e2c4848b1d555484 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
-Date: Tue, 1 Sep 2026 12:00:00 +1000
-Subject: [PATCH 07/19] isp: validate everything the firmware hands back
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 08/21] isp: validate what the firmware hands back
 
-The driver took firmware-supplied values on trust, and one of them was a
-kernel pointer round trip: the shared-malloc handler wrote the address of an
-isp_mem_obj into ISP memory and dereferenced whatever came back as a free
-request. Firmware could name any address it liked.
+Treat the firmware as an untrusted producer:
 
-Track ISP memory objects on a list under a new mem_lock and identify them by
-offset instead. isp_mem_destroy_offset() frees the object at a given offset
-and type, or reports -ENOENT and warns; isp_mem_destroy_all() reclaims the
-whole list, which is what isp_uninit() now uses. The header written into
-shared memory is a zeroed 64-byte block rather than a pointer.
-
-The rest of the firmware-supplied data is checked where it arrives:
-
-  - the channel descriptor table is range-checked before it is read, the
-    channel count is bounded, and each channel's type, source, size and ring
-    offset are validated against the mapped BAR before the ring is used;
-    channel names are NUL-terminated.
-  - the command response address must equal the request object we submitted,
-    and a response may not be longer than the object holding it.
-  - isp_init() fails if the firmware never established channel_io,
-    channel_buf_h2t and channel_buf_t2h, instead of leaving NULL pointers
-    for a later dereference.
-  - CH_INFO_GET's sensor count is validated, and the camera-config sensor
-    resolution is rejected unless it is plausible.
-  - the firmware image is refused if it is larger than the preallocated
-    region.
-
-Ring and IRQ processing are bounded. fthd_handle_irq() drained the ring in a
-while loop with no limit, so malformed data could keep a global workqueue
-worker busy indefinitely; it now stops after chan->size entries and warns.
-fthd_irq_work() reused its retry counter `i` as the channel-loop index, so
-the 500-iteration escape hatch never worked as intended - the counters are
-now separate. BUG_ON(chan->source > 3) on a firmware-supplied value becomes
-WARN_ON_ONCE() and a skip.
-
-Finally, the ring index is advanced after the entry is filled in rather than
-before, so an entry cannot be published under an index the producer has
-already moved past.
+- validate the channel description table (count, type, source, ring
+  bounds) before using it, and NUL-terminate channel names;
+- track ISP memory objects on a list and free shared memory by offset
+  instead of reading a kernel pointer back from ISP memory, and stop
+  writing kernel pointers into it;
+- bound the IRQ work loop and each ring drain, and turn the BUG_ON()
+  on a bad channel source into a WARN_ON_ONCE();
+- check the sensor count and resolutions the firmware reports;
+- replace the BUG_ON() on a duplicate set-file load with a warning, and
+  handle a failed set-file allocation.
 ---
- fthd_drv.c     |  56 ++++++++++++-----
- fthd_drv.h     |   2 +
- fthd_isp.c     | 166 ++++++++++++++++++++++++++++++++++++++++---------
- fthd_isp.h     |   4 ++
- fthd_ringbuf.c |   5 +-
- 5 files changed, 186 insertions(+), 47 deletions(-)
+ fthd_drv.c |  48 +++++++++++-----
+ fthd_drv.h |   4 +-
+ fthd_isp.c | 159 ++++++++++++++++++++++++++++++++++++++++++++---------
+ fthd_isp.h |   4 ++
+ 4 files changed, 175 insertions(+), 40 deletions(-)
 
 diff --git a/fthd_drv.c b/fthd_drv.c
-index 6bdc817..207dc8e 100644
+index a8bd2c9..a2123ef 100644
 --- a/fthd_drv.c
 +++ b/fthd_drv.c
-@@ -126,6 +126,7 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
+@@ -87,6 +87,7 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
  {
  	u32 request_size, response_size, address;
  	struct isp_mem_obj *obj;
@@ -61,7 +34,7 @@ index 6bdc817..207dc8e 100644
  	int ret;
  
  	request_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_REQUEST_SIZE);
-@@ -134,14 +135,19 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
+@@ -95,14 +96,19 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
  
  	if (address) {
  		pr_debug("Firmware wants to free memory at %08x\n", address);
@@ -76,8 +49,7 @@ index 6bdc817..207dc8e 100644
  
  		ret = fthd_channel_ringbuf_send(dev_priv, chan, 0, 0, 0, NULL);
  		if (ret)
--			pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
-+			dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 			dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
  	} else {
 -		if (!request_size)
 +		if (dev_priv->s2_mem_len < sizeof(header) || !request_size ||
@@ -85,7 +57,7 @@ index 6bdc817..207dc8e 100644
  			return;
  		obj = isp_mem_create(dev_priv, FTHD_MEM_SHAREDMALLOC, request_size + 64);
  		if (!obj)
-@@ -150,10 +156,16 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
+@@ -111,10 +117,16 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
  		pr_debug("Firmware allocated %d bytes at %08lx (tag %c%c%c%c)\n", request_size, obj->offset,
  			 response_size >> 24,response_size >> 16,
  			 response_size >> 8, response_size);
@@ -97,15 +69,14 @@ index 6bdc817..207dc8e 100644
 +		}
  		ret = fthd_channel_ringbuf_send(dev_priv, chan, obj->offset + 64, 0, 0, NULL);
 -		if (ret)
--			pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
 +		if (ret) {
-+			dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 			dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
 +			isp_mem_destroy(obj);
 +		}
  
  	}
  
-@@ -219,7 +231,7 @@ static void io_t2h_handler(struct fthd_private *dev_priv,
+@@ -180,7 +192,7 @@ static void io_t2h_handler(struct fthd_private *dev_priv,
  static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *chan)
  {
  	u32 entry;
@@ -114,7 +85,7 @@ index 6bdc817..207dc8e 100644
  
  	if (chan == dev_priv->channel_io) {
  		pr_debug("IO channel ready\n");
-@@ -239,7 +251,12 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
+@@ -200,7 +212,12 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
  		return;
  	}
  
@@ -128,7 +99,7 @@ index 6bdc817..207dc8e 100644
  		pr_debug("channel %s: message available, address %08x\n", chan->name, FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS));
  		if (chan == dev_priv->channel_shared_malloc) {
  			sharedmalloc_handler(dev_priv, chan, entry);
-@@ -254,6 +271,9 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
+@@ -215,6 +232,9 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
  			io_t2h_handler(dev_priv, chan, entry);
  		}
  	}
@@ -138,7 +109,7 @@ index 6bdc817..207dc8e 100644
  }
  
  static void fthd_irq_uninstall(struct fthd_private *dev_priv)
-@@ -267,9 +287,9 @@ static void fthd_irq_work(struct work_struct *work)
+@@ -228,9 +248,9 @@ static void fthd_irq_work(struct work_struct *work)
  	struct fw_channel *chan;
  
  	u32 pending;
@@ -150,7 +121,7 @@ index 6bdc817..207dc8e 100644
  		spin_lock_irq(&dev_priv->io_lock);
  		pending = FTHD_ISP_REG_READ(ISP_IRQ_STATUS);
  		spin_unlock_irq(&dev_priv->io_lock);
-@@ -283,20 +303,22 @@ static void fthd_irq_work(struct work_struct *work)
+@@ -244,18 +264,18 @@ static void fthd_irq_work(struct work_struct *work)
  		spin_unlock_irq(&dev_priv->io_lock);
  		pci_write_config_dword(dev_priv->pdev, 0x90, 0x200);
  
@@ -171,24 +142,19 @@ index 6bdc817..207dc8e 100644
 -	if (i >= 500) {
 +	if (loops >= 500) {
  		dev_err(&dev_priv->pdev->dev, "irq stuck, disabling\n");
--		fthd_irq_uninstall(dev_priv);
-+		FTHD_ISP_REG_WRITE(0, ISP_IRQ_ENABLE);
-+		pci_write_config_dword(dev_priv->pdev, 0x94, 0);
-+		return;
+ 		fthd_irq_uninstall(dev_priv);
  	}
- 	pci_write_config_dword(dev_priv->pdev, 0x94, 0x200);
- }
-@@ -585,6 +607,8 @@ static int fthd_pci_probe(struct pci_dev *pdev,
- 
+@@ -469,6 +489,8 @@ static int fthd_pci_probe(struct pci_dev *pdev,
  	mutex_init(&dev_priv->ioctl_lock);
- 	mutex_init(&dev_priv->pm_lock);
+ 	atomic_set(&dev_priv->users, 0);
+ 	INIT_LIST_HEAD(&dev_priv->buffer_queue);
 +	mutex_init(&dev_priv->mem_lock);
 +	INIT_LIST_HEAD(&dev_priv->mem_objects);
- 	INIT_LIST_HEAD(&dev_priv->buffer_queue);
  	INIT_WORK(&dev_priv->irq_work, fthd_irq_work);
  
+ 	dev_priv->pdev = pdev;
 diff --git a/fthd_drv.h b/fthd_drv.h
-index 6c0eeba..f68d65d 100644
+index a845dcf..db69b7e 100644
 --- a/fthd_drv.h
 +++ b/fthd_drv.h
 @@ -84,6 +84,8 @@ struct fthd_private {
@@ -200,19 +166,22 @@ index 6c0eeba..f68d65d 100644
  	/* Resource for managing IO mmu slots */
  	struct resource *iommu;
  	/* ISP memory objects */
+@@ -116,9 +118,9 @@ struct fthd_private {
+ 	struct fthd_fmt fmt;
+ 
+ 	struct vb2_queue vb2_queue;
++	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
+ 	struct mutex vb2_queue_lock;
+ 	struct list_head buffer_queue;
+-	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
+ 
+ 	struct v4l2_ctrl_handler v4l2_ctrl_handler;
+ 	u32 frame_rate; /* 1/256 fps */
 diff --git a/fthd_isp.c b/fthd_isp.c
-index 03ded4c..b72b55b 100644
+index 9b19f86..331d4d5 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
-@@ -50,39 +50,97 @@ struct isp_mem_obj *isp_mem_create(struct fthd_private *dev_priv,
- 	struct resource *root = dev_priv->mem;
- 	int ret;
- 
-+	if (!root || !size || size > dev_priv->s2_mem_len)
-+		return NULL;
-+
- 	obj = kzalloc(sizeof(struct isp_mem_obj), GFP_KERNEL);
- 	if (!obj)
+@@ -56,34 +56,89 @@ struct isp_mem_obj *isp_mem_create(struct fthd_private *dev_priv,
  		return NULL;
  
  	obj->type = type;
@@ -306,56 +275,7 @@ index 03ded4c..b72b55b 100644
  static int isp_acpi_set_power(struct fthd_private *dev_priv, int power)
  {
  	acpi_status status;
-@@ -154,8 +212,18 @@ static int isp_load_firmware(struct fthd_private *dev_priv)
- 		return ret;
- 
- 	/* Firmware memory is preallocated at init time */
--	if (!dev_priv->firmware)
--		return -ENOMEM;
-+	if (!dev_priv->firmware) {
-+		ret = -ENOMEM;
-+		goto out_release;
-+	}
-+
-+	if (fw->size > dev_priv->firmware->size) {
-+		dev_err(&dev_priv->pdev->dev,
-+			"Firmware image is too large (%zu > %llu bytes)\n",
-+			fw->size, (unsigned long long)dev_priv->firmware->size);
-+		ret = -EFBIG;
-+		goto out_release;
-+	}
- 
- 	if (dev_priv->firmware->base.start != dev_priv->mem->start) {
- 		dev_err(&dev_priv->pdev->dev,
-@@ -163,18 +231,22 @@ static int isp_load_firmware(struct fthd_private *dev_priv)
- 			dev_priv->firmware->offset);
- 		isp_mem_destroy(dev_priv->firmware);
- 		dev_priv->firmware = NULL;
--		return -EBUSY;
-+		ret = -EBUSY;
-+		goto out_release;
- 	}
- 
--	FTHD_S2_MEMCPY_TOIO(dev_priv->firmware->offset, fw->data, fw->size);
-+	ret = FTHD_S2_MEMCPY_TOIO(dev_priv->firmware->offset,
-+				   fw->data, fw->size);
-+	if (ret)
-+		goto out_release;
- 
- 	/* Might need a flush here if we map ISP memory cached */
- 
--	dev_info(&dev_priv->pdev->dev, "Loaded firmware, size: %lukb\n",
--		 fw->size / 1024);
-+	dev_dbg(&dev_priv->pdev->dev, "Loaded firmware, size: %lukb\n",
-+		fw->size / 1024);
- 
-+out_release:
- 	release_firmware(fw);
--
- 	return ret;
- }
- 
-@@ -213,27 +285,37 @@ static struct fw_channel *isp_get_chan_index(struct fthd_private *priv, const ch
+@@ -220,27 +275,37 @@ static struct fw_channel *isp_get_chan_index(struct fthd_private *priv, const ch
  	return NULL;
  }
  
@@ -399,14 +319,14 @@ index 03ded4c..b72b55b 100644
  
  		dev_priv->channels[i] = chan;
  
-@@ -241,8 +323,21 @@ static int isp_fill_channel_info(struct fthd_private *dev_priv, int offset, int
+@@ -248,8 +313,21 @@ static int isp_fill_channel_info(struct fthd_private *dev_priv, int offset, int
  			 i, info.name, info.type, info.source, info.size, info.offset);
  
  		chan->name = kstrdup(info.name, GFP_KERNEL);
 -		if (!chan->name)
 +		if (!chan->name) {
 +			ret = -ENOMEM;
- 			goto out;
++			goto out;
 +		}
 +
 +		if (info.type > FW_CHAN_TYPE_UNI_IN || info.source > 3 ||
@@ -417,12 +337,12 @@ index 03ded4c..b72b55b 100644
 +					     FTHD_RINGBUF_ENTRY_SIZE)) {
 +			dev_err(&dev_priv->pdev->dev,
 +				"Invalid firmware channel %s\n", info.name);
-+			goto out;
+ 			goto out;
 +		}
  
  		chan->type = info.type;
  		chan->source = info.source;
-@@ -270,7 +365,7 @@ static int isp_fill_channel_info(struct fthd_private *dev_priv, int offset, int
+@@ -277,7 +355,7 @@ static int isp_fill_channel_info(struct fthd_private *dev_priv, int offset, int
  	return 0;
  out:
  	isp_free_channel_info(dev_priv);
@@ -431,7 +351,7 @@ index 03ded4c..b72b55b 100644
  }
  
  static int fthd_isp_cmd(struct fthd_private *dev_priv, enum fthd_isp_cmds command, void *buf,
-@@ -453,12 +548,6 @@ static int fthd_isp_cmd_powerdown(struct fthd_private *dev_priv)
+@@ -460,12 +538,6 @@ static int fthd_isp_cmd_powerdown(struct fthd_private *dev_priv)
  	return fthd_isp_cmd(dev_priv, CISP_CMD_POWER_DOWN, NULL, 0, NULL);
  }
  
@@ -444,7 +364,7 @@ index 03ded4c..b72b55b 100644
  int isp_powerdown(struct fthd_private *dev_priv)
  {
  	int retries;
-@@ -508,9 +597,13 @@ int isp_uninit(struct fthd_private *dev_priv)
+@@ -515,8 +587,11 @@ int isp_uninit(struct fthd_private *dev_priv)
  
  	FTHD_ISP_REG_WRITE(0xffffffff, ISP_IRQ_CLEAR);
  	isp_free_channel_info(dev_priv);
@@ -456,11 +376,35 @@ index 03ded4c..b72b55b 100644
 +	dev_priv->ipc_queue = NULL;
 +	dev_priv->heap = NULL;
  	kfree(dev_priv->mem);
-+	dev_priv->mem = NULL;
  	return 0;
  }
+@@ -617,11 +692,22 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
+ 		return 0;
+ 	}
  
-@@ -624,10 +717,20 @@ int fthd_isp_cmd_channel_info(struct fthd_private *dev_priv)
+-	/* Firmware memory is preallocated at init time */
+-	BUG_ON(dev_priv->set_file);
++	if (dev_priv->set_file) {
++		dev_warn(&dev_priv->pdev->dev,
++			 "set file is already loaded; ignoring duplicate request\n");
++		release_firmware(fw);
++		return 0;
++	}
+ 
+ 	file = isp_mem_create(dev_priv, FTHD_MEM_SET_FILE, fw->size);
+-	FTHD_S2_MEMCPY_TOIO(file->offset, fw->data, fw->size);
++	if (!file) {
++		dev_warn(&dev_priv->pdev->dev,
++			 "not enough ISP memory for set file\n");
++		release_firmware(fw);
++		return 0;
++	}
++
++	ret = FTHD_S2_MEMCPY_TOIO(file->offset, fw->data, fw->size);
+ 
+ 	release_firmware(fw);
+ 	if (ret) {
+@@ -652,10 +738,20 @@ int fthd_isp_cmd_channel_info(struct fthd_private *dev_priv)
  	memset(&cmd, 0, sizeof(cmd));
  	len = sizeof(cmd);
  	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_INFO_GET, &cmd, sizeof(cmd), &len);
@@ -482,7 +426,28 @@ index 03ded4c..b72b55b 100644
  	pr_debug("sensor serial number: %02X%02X%02X%02X%02X%02X%02X%02X\n",
  		 cmd.sensor_serial_number[0], cmd.sensor_serial_number[1],
  		 cmd.sensor_serial_number[2], cmd.sensor_serial_number[3],
-@@ -1475,5 +1578,12 @@ int isp_init(struct fthd_private *dev_priv)
+@@ -709,10 +805,14 @@ int fthd_isp_cmd_channel_camera_config(struct fthd_private *dev_priv)
+ 			unsigned int w = cmd.data[0] | (cmd.data[1] << 8);
+ 			unsigned int h = cmd.data[2] | (cmd.data[3] << 8);
+ 
+-			if (w && h) {
++			if (w >= 320 && w <= 4096 && h >= 240 && h <= 2160) {
+ 				dev_priv->sensor_width = w;
+ 				dev_priv->sensor_height = h;
+ 				pr_debug("sensor native resolution: %ux%u\n", w, h);
++			} else {
++				dev_warn(&dev_priv->pdev->dev,
++					 "ignoring invalid sensor resolution %ux%u\n",
++					 w, h);
+ 			}
+ 		}
+ 	}
+@@ -1548,9 +1648,16 @@ int isp_init(struct fthd_private *dev_priv)
+ 			dev_err(&dev_priv->pdev->dev, "Init failed! No magic value\n");
+ 			isp_uninit(dev_priv);
+ 			return -EIO;
+-		} /* FIXME: free on error path */
++		}
  		dev_dbg(&dev_priv->pdev->dev, "magic value: %08x after %d ms\n", reg, (retries - 1) * 10);
  	}
  
@@ -496,7 +461,7 @@ index 03ded4c..b72b55b 100644
  	return 0;
  }
 diff --git a/fthd_isp.h b/fthd_isp.h
-index 6b8e5da..10c5fc1 100644
+index 997e27b..fa77924 100644
 --- a/fthd_isp.h
 +++ b/fthd_isp.h
 @@ -477,6 +477,8 @@ enum isp_debug_cmds {
@@ -517,26 +482,3 @@ index 6b8e5da..10c5fc1 100644
  extern int fthd_isp_cmd_start(struct fthd_private *dev_priv);
  extern int fthd_isp_cmd_stop(struct fthd_private *dev_priv);
  extern int isp_powerdown(struct fthd_private *dev_priv);
-diff --git a/fthd_ringbuf.c b/fthd_ringbuf.c
-index 7b099ae..dd183fb 100644
---- a/fthd_ringbuf.c
-+++ b/fthd_ringbuf.c
-@@ -76,9 +76,6 @@ int fthd_channel_ringbuf_send(struct fthd_private *dev_priv, struct fw_channel *
- 	spin_lock_irq(&chan->lock);
- 	entry = get_entry_addr(dev_priv, chan, chan->ringbuf.idx);
- 
--	if (++chan->ringbuf.idx >= chan->size)
--		chan->ringbuf.idx = 0;
--
- 	if (!(FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^ (chan->type != 0)) {
- 		spin_unlock_irq(&chan->lock);
- 		return -EAGAIN;
-@@ -89,6 +86,8 @@ int fthd_channel_ringbuf_send(struct fthd_private *dev_priv, struct fw_channel *
- 	wmb();
- 	FTHD_S2_MEM_WRITE(data_offset | (chan->type == 0 ? 0 : 1),
- 			  entry + FTHD_RINGBUF_ADDRESS_FLAGS);
-+	if (++chan->ringbuf.idx >= chan->size)
-+		chan->ringbuf.idx = 0;
- 	spin_unlock_irq(&chan->lock);
- 
- 	spin_lock_irq(&dev_priv->io_lock);

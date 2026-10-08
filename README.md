@@ -227,7 +227,7 @@ produces incorrect colours, so `install.sh` fetches them on every run where
   it for that release. The installer warns and continues.
 - **Your sensor is not one of the four the download carries.** The driver
   recognises eleven; a machine needing one of the other seven logs
-  `no sensor calibration file ...` in `dmesg`, and `install.sh --status`
+  `set file ... is missing` in `dmesg`, and `install.sh --status`
   reports the same.
 
 Once the cause is fixed, retry the calibration step on its own:

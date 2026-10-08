@@ -1,59 +1,21 @@
-From af04f891f0b207f63e11d22b1254521641d0ea19 Mon Sep 17 00:00:00 2001
+From 9e0826071e97a11adeb023632250c5867a023687 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
-Date: Tue, 1 Sep 2026 12:00:00 +1000
-Subject: [PATCH 17/19] debugfs: expose the confirmed firmware readbacks
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 19/21] debugfs: expose confirmed firmware readbacks
 
-Fifteen firmware GETs whose wire layout has been recovered and confirmed on
-hardware, as mode-0400 debugfs files under
-/sys/kernel/debug/facetimehd/<pci-id>/: sensor_temperature_raw, awb_cct_raw,
-ae_bias_raw, five AE gain-cap and integration-time limits, ae_metering_mode_raw,
-ae_frame_rate_{max,min}_raw, awb_2nd_gain_raw and crop_raw.
-
-The governing rule after the lockups that removed the inferred controls is:
-GET first, and a recovered value reaches V4L2 only once its meaning is
-established. Everything whose meaning is not established stays here. Each
-read takes ioctl_lock, requires a running channel (an idle read fails with
--EPIPE rather than powering the ISP up), holds a runtime-PM reference for
-exactly one command, and adds nothing to STREAMON or resume. Nothing polls,
-and there is no arbitrary-opcode input. They are named "raw" because
-firmware documents no units or ranges.
-
-Three of them answer their question rather than asking one:
-
-  - sensor_temperature_raw returns -1 on this sensor, always: cold after
-    boot, after ten minutes of continuous streaming, and under bright, dark,
-    warm and cool light. A physical scale, however unknown, would have moved
-    with die temperature over that stream, so -1 is a not-supported
-    sentinel. The file prints "-1 (unavailable)", raw number first. hwmon
-    registration would be wrong even on a sensor that returns something
-    else, because that ABI requires millidegrees Celsius and no reading here
-    establishes a unit.
-  - ae_frame_rate_max_raw and ae_frame_rate_min_raw both read 7672, which is
-    29.97 fps in Q8.8. Minimum equal to maximum means the window is clamped
-    to the sensor's single rate - the readable reason behind the behavioural
-    conclusion that produced frame decimation. Both handlers compare a
-    channel-context field against 0xffff first and take a path that never
-    writes the response word when it matches, so a zero means "firmware
-    wrote nothing", not "zero frames per second"; the file says so.
-  - awb_2nd_gain_raw returns three words, not the two an R/B reading would
-    predict, so they are printed positionally with no colour named. All
-    three read exactly 4096 while the CCT estimate reported 2785 - markedly
-    warm light, in which a live gain triple cannot be equal on all three
-    channels - which makes it a manual stage sitting at unity.
-
-crop_raw returns eight words where CISP_CMD_CH_CROP_SET sends four: the
-first group tracks the programmed crop exactly, the second stays at
-0 0 1280 720 across every rectangle tested. The struct names them rect1 and
-rect2 by position rather than by meaning, because that identification is one
-machine's.
+Add root-only debugfs files for fifteen firmware GET commands whose
+layouts are confirmed: sensor temperature, AWB colour temperature and
+second gain, AE bias, gain caps, integration-time limits, metering mode,
+frame-rate window and crop. Each read requires a running channel,
+issues exactly one command and adds nothing to stream setup.
 ---
  fthd_debugfs.c | 258 +++++++++++++++++++++++++++++++++++++++++++++++++
- fthd_isp.c     | 190 ++++++++++++++++++++++++++++++++++++
- fthd_isp.h     | 100 +++++++++++++++++++
- 3 files changed, 548 insertions(+)
+ fthd_isp.c     | 166 +++++++++++++++++++++++++++++++
+ fthd_isp.h     |  88 +++++++++++++++++
+ 3 files changed, 512 insertions(+)
 
 diff --git a/fthd_debugfs.c b/fthd_debugfs.c
-index fd7efaa..da103cb 100644
+index 5855242..b10e415 100644
 --- a/fthd_debugfs.c
 +++ b/fthd_debugfs.c
 @@ -239,6 +239,217 @@ static int seq_channel_debug_read(struct seq_file *seq, void *data)
@@ -77,7 +39,6 @@ index fd7efaa..da103cb 100644
 +	FTHD_FW_AWB_2ND_GAIN,
 +	FTHD_FW_CROP,
 +};
-+
 +
 +/*
 + * These files are deliberately unlike the ring-state diagnostics above.
@@ -271,10 +232,11 @@ index fd7efaa..da103cb 100644
 +FTHD_FW_READBACK_SHOW(seq_crop_raw_read, FTHD_FW_CROP);
 +
 +#undef FTHD_FW_READBACK_SHOW
- 
++
  static int fthd_debugfs_seq_open(struct inode *inode, struct file *file,
  				 int (*show)(struct seq_file *, void *))
-@@ -290,6 +501,21 @@ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_io_t2h_read);
+ {
+@@ -289,6 +500,21 @@ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_io_t2h_read);
  FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_h2t_read);
  FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_t2h_read);
  FTHD_DEBUGFS_SEQ_FOPS(seq_channel_debug_read);
@@ -296,7 +258,7 @@ index fd7efaa..da103cb 100644
  
  static const struct file_operations fops_debug = {
  	.write = fthd_store_debug,
-@@ -339,6 +565,38 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
+@@ -338,6 +564,38 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
  			    &seq_channel_buf_t2h_read_fops);
  	debugfs_create_file("channel_debug", 0400, d, dev_priv,
  			    &seq_channel_debug_read_fops);
@@ -336,10 +298,10 @@ index fd7efaa..da103cb 100644
  	dev_priv->debugfs = d;
  	fthd_debugfs_users++;
 diff --git a/fthd_isp.c b/fthd_isp.c
-index 4ebb5f6..93b388b 100644
+index b480b19..a501eb1 100644
 --- a/fthd_isp.c
 +++ b/fthd_isp.c
-@@ -1247,6 +1247,25 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
+@@ -1252,6 +1252,25 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
  	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_SET, &cmd, sizeof(cmd), &len);
  }
  
@@ -365,34 +327,10 @@ index 4ebb5f6..93b388b 100644
  /*
   * Anti-banding.  CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET is one of the
   * Apple-private opcodes. Firmware reads one word at command offset +0x0c,
-@@ -1267,6 +1286,177 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
+@@ -1272,6 +1291,153 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int
  	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
  }
  
-+/* Not exposed to userspace: encoding and tag semantics are still unknown. */
-+int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv,
-+					  int channel, u16 bias, u32 tag)
-+{
-+	struct isp_cmd_channel_ae_bias_set cmd;
-+	int len;
-+
-+	pr_debug("set ae bias raw %u tag %u\n", bias, tag);
-+
-+	memset(&cmd, 0, sizeof(cmd));
-+	cmd.channel = channel;
-+	cmd.bias = bias;
-+	cmd.tag = tag;
-+	len = sizeof(cmd);
-+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_SET, &cmd, sizeof(cmd), &len);
-+}
-+
-+int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv,
-+				      int channel, int bias)
-+{
-+	return fthd_isp_cmd_channel_ae_bias_set_raw(dev_priv, channel,
-+						     (u16)bias, 0);
-+}
-+
 +int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel,
 +				      u16 *bias, u32 *tag)
 +{
@@ -544,10 +482,10 @@ index 4ebb5f6..93b388b 100644
  {
  	struct isp_cmd_channel_brightness_set cmd;
 diff --git a/fthd_isp.h b/fthd_isp.h
-index b9038b9..66043af 100644
+index efc27c2..fcc6ad9 100644
 --- a/fthd_isp.h
 +++ b/fthd_isp.h
-@@ -681,6 +681,89 @@ struct isp_cmd_channel_ae_flicker_freq_set {
+@@ -681,6 +681,79 @@ struct isp_cmd_channel_ae_flicker_freq_set {
  	u32 freq;
  };
  
@@ -560,16 +498,6 @@ index b9038b9..66043af 100644
 + * FIRMWARE-REVERSE-ENGINEERING.md.
 + */
 +
-+/* Firmware reads a 16-bit value and a 32-bit tag. The encoding and tag
-+ * semantics are not known; see FIRMWARE-REVERSE-ENGINEERING.md. */
-+struct isp_cmd_channel_ae_bias_set {
-+	u32 channel;
-+	u16 bias;
-+	u16 reserved;
-+	u32 tag;
-+};
-+
-+/* The corresponding GET writes the same bias/tag pair after the channel. */
 +struct isp_cmd_channel_ae_bias_get {
 +	u32 channel;
 +	u16 bias;
@@ -637,14 +565,12 @@ index b9038b9..66043af 100644
  struct isp_cmd_channel_start {
  	u32 channel;
  };
-@@ -773,7 +856,24 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
+@@ -773,7 +846,22 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
  extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_priv, int channel);
  extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
  extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
 +extern int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv, int channel, u8 *mode);
  extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
-+extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias);
-+extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
 +extern int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel, u16 *bias, u32 *tag);
 +extern int fthd_isp_cmd_channel_ae_gain_cap_get(struct fthd_private *dev_priv, int channel, u32 *value);
 +extern int fthd_isp_cmd_channel_ae_gain_cap_min_get(struct fthd_private *dev_priv, int channel, u32 *value);

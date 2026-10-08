@@ -353,9 +353,7 @@ static int fthd_irq_install(struct fthd_private *dev_priv)
 {
 	int ret;
 
-	/* IRQF_SHARED was needed for the legacy INTx line pci_enable_msi()
-	 * used to leave as a fallback; a single MSI vector, allocated below,
-	 * is never shared with another device. */
+	/* A single MSI vector is never shared with another device. */
 	ret = request_irq(pci_irq_vector(dev_priv->pdev, 0), fthd_irq_handler, 0,
 			  KBUILD_MODNAME, (void *)dev_priv);
 
@@ -913,22 +911,18 @@ static struct pci_driver fthd_pci_driver = {
 module_pci_driver(fthd_pci_driver);
 
 MODULE_FIRMWARE("facetimehd/firmware.bin");
-/* Sensor calibration files - see fthd_isp_cmd_set_loadfile() for which model
- * requests which one. Listed here so dracut/update-initramfs and `modinfo`
- * can see them; extract-firmware.sh's --calibration-only is what installs
- * them, and a missing one is logged but non-fatal. */
-MODULE_FIRMWARE("facetimehd/8221_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1222_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1571_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1575_01XX.dat");
-MODULE_FIRMWARE("facetimehd/9112_01XX.dat");
-MODULE_FIRMWARE("facetimehd/1771_01XX.dat");
-MODULE_FIRMWARE("facetimehd/1874_01XX.dat");
-MODULE_FIRMWARE("facetimehd/1871_01XX.dat");
+MODULE_FIRMWARE("facetimehd/1671_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1674_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1675_01XX.dat");
-MODULE_FIRMWARE("facetimehd/1671_01XX.dat");
+MODULE_FIRMWARE("facetimehd/1771_01XX.dat");
+MODULE_FIRMWARE("facetimehd/1871_01XX.dat");
+MODULE_FIRMWARE("facetimehd/1874_01XX.dat");
+MODULE_FIRMWARE("facetimehd/8221_01XX.dat");
+MODULE_FIRMWARE("facetimehd/9112_01XX.dat");
 MODULE_DEVICE_TABLE(pci, fthd_pci_id_table);
 MODULE_AUTHOR("Patrik Jakobsson <patrik.r.jakobsson@gmail.com>");
 MODULE_DESCRIPTION("FacetimeHD camera driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

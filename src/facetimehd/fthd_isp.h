@@ -747,55 +747,6 @@ struct isp_cmd_channel_ae_metering_mode_get {
 	u8 reserved[3];
 };
 
-/* Manual sensor integration time. The wire width is proven; units are not. */
-struct isp_cmd_channel_ae_integration_time_set {
-	u32 channel;
-	u32 time;
-};
-
-/* Firmware consumes both words after the channel. The first appears to be CCT
- * and the second is likely a tag, but neither semantic is yet an ABI. */
-struct isp_cmd_channel_awb_cct_manual {
-	u32 channel;
-	u32 cct;
-	u32 tag;
-};
-
-struct isp_cmd_channel_sharpness_set {
-	u32 channel;
-	u8 sharpness;
-	u8 reserved[3];
-};
-
-struct isp_cmd_channel_test_pattern_config {
-	u32 channel;
-	u16 unknown;
-	u16 pattern;
-};
-
-/* Spatial noise-reduction byte. */
-struct isp_cmd_channel_noise_reduction_set {
-	u32 channel;
-	u8 strength;
-	u8 reserved[3];
-};
-
-/* Firmware consumes three distinct bytes. Their meanings are unknown, so this
- * structure must not be exposed as one generic strength control. */
-struct isp_cmd_channel_chroma_suppression_set {
-	u32 channel;
-	u8 field0;
-	u8 field1;
-	u8 field2;
-};
-
-/* Dynamic-range-compression byte. */
-struct isp_cmd_channel_drc_set {
-	u32 channel;
-	u8 strength;
-	u8 reserved[3];
-};
-
 /* Sensor die temperature.  A GET: @temperature is written by the firmware.
  * The scale is not documented; see fthd_isp_cmd_channel_sensor_temperature()
  * for how the driver avoids having to guess one. */
@@ -907,7 +858,6 @@ extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_pri
 extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
 extern int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv, int channel, u8 *mode);
 extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
-extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias);
 extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
 extern int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel, u16 *bias, u32 *tag);
 extern int fthd_isp_cmd_channel_ae_gain_cap_get(struct fthd_private *dev_priv, int channel, u32 *value);
@@ -920,19 +870,11 @@ extern int fthd_isp_cmd_channel_ae_integration_time_max_get(struct fthd_private 
 extern int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
 extern int fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
 extern int fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
-extern int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel, unsigned int usec);
-extern int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel, unsigned int gain);
 extern int fthd_isp_cmd_channel_awb_cct_get(struct fthd_private *dev_priv, int channel, u32 *value);
 extern int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv, int channel, u32 gain[3]);
 extern int fthd_isp_cmd_channel_ae_frame_rate_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
 extern int fthd_isp_cmd_channel_ae_frame_rate_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
 extern int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel, u32 rect1[4], u32 rect2[4]);
-extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel, unsigned int cct);
-extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
-extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);
-extern int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength);
-extern int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength);
-extern int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength);
 extern int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw);
 extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
 extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);

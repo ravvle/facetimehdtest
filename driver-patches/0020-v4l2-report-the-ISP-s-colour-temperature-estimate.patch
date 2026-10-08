@@ -1,50 +1,19 @@
-From 5eda5d6dc4dd2c62fef276edeb53daf876c0b985 Mon Sep 17 00:00:00 2001
+From bef62d756a0c1ad03d9b44fd08a17de89ffc8e76 Mon Sep 17 00:00:00 2001
 From: facetimehd downstream <facetimehd-downstream@localhost>
-Date: Tue, 1 Sep 2026 12:00:00 +1000
-Subject: [PATCH 18/19] v4l2: report the ISP colour-temperature estimate
- read-only
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 20/21] v4l2: report the ISP's colour-temperature estimate
 
-FTHD_CID_AWB_CCT_ESTIMATE (V4L2_CID_USER_BASE | 0x1003, printed by
-v4l-utils as awb_cct_estimate) reports the ISP's own current
-colour-temperature estimate from CISP_CMD_CH_AWB_CCT_GET. It is the one
-firmware value recovered during the lockup investigation that reaches the
-ordinary V4L2 surface, and three things justify that.
-
-Why it is safe to register. The rule the removed controls broke is that
-v4l2_ctrl_handler_setup() replays every registered control's default at each
-STREAMON. This control is V4L2_CTRL_FLAG_READ_ONLY, and handler_setup()
-skips read-only controls outright - so registering it adds a GET an
-application may ask for and no SET the framework can ever replay. That is a
-structural guarantee rather than a convention.
-
-Why the unit is not a guess. Under warm light this firmware reports around
-2652 and under cool light 5777, with the right ordering and realistic
-magnitudes; the value tracks lighting and not exposure. Cross-model
-confirmation is still open, which is part of why it is a private CID.
-
-Why not V4L2_CID_WHITE_BALANCE_TEMPERATURE. That control means the
-temperature an application asks the camera to *assume*: writable, paired
-with a manual AWB mode. This is a measurement the ISP produces, and the
-manual AWB-CCT setter carries a second payload word whose meaning is
-unidentified, so there is nothing to write. Publishing a measurement under a
-CID that means a set point would make an application that wrote it silently
-get nothing. 0x1001 and 0x1002 are deliberately skipped: they belonged to
-the removed noise-reduction and chroma-suppression controls.
-
-The control is volatile, so g_volatile_ctrl issues the GET on demand under a
-runtime-PM reference. It does not take ioctl_lock, because vdev->lock *is*
-ioctl_lock and video_ioctl2() already holds it - which is also what
-serialises it against the debugfs readbacks. On an idle camera it reports
-the last value sampled while streaming rather than failing or powering the
-ISP up: a diagnostic read is not a reason to retrain DDR and re-upload
-firmware, and returning an error there would fail v4l2-compliance for no
-gain.
+Add a read-only, volatile private control, awb_cct_estimate, with the
+ISP's current colour-temperature estimate. Being read-only, it is never
+replayed by v4l2_ctrl_handler_setup(). It is private rather than
+V4L2_CID_WHITE_BALANCE_TEMPERATURE because that control is a set point.
+An idle camera reports the last sampled value rather than powering up.
 ---
- fthd_v4l2.c | 108 ++++++++++++++++++++++++++++++++++++++++++++++++----
- 1 file changed, 101 insertions(+), 7 deletions(-)
+ fthd_v4l2.c | 99 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 96 insertions(+), 3 deletions(-)
 
 diff --git a/fthd_v4l2.c b/fthd_v4l2.c
-index 69cba17..45b463b 100644
+index 7a9abee..5c6a2d5 100644
 --- a/fthd_v4l2.c
 +++ b/fthd_v4l2.c
 @@ -30,6 +30,37 @@
@@ -83,24 +52,11 @@ index 69cba17..45b463b 100644
 +#define FTHD_AWB_CCT_MAX 65535
 +
  /*
-  * The ISP's semi-planar output, format code 0, is NV12 - and hardware said so.
-  *
-@@ -1522,12 +1553,6 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
+  * The ISP's semi-planar output, format code 0, is NV12.  Measured on a
+  * MacBookAir7,2: a width*height luma plane followed by exactly width*height/2
+@@ -1497,10 +1528,50 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
  	.vidioc_log_status      = v4l2_ctrl_log_status,
  };
- 
--static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
--{
--	pr_debug("id = %x\n", ctrl->id);
--	return -EINVAL;
--}
--
- static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
- {
- 	struct fthd_private *dev_priv = container_of(ctrl->handler, struct fthd_private, v4l2_ctrl_handler);
-@@ -1576,10 +1601,75 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
- 	return ret;
- }
  
 +/*
 + * Only FTHD_CID_AWB_CCT_ESTIMATE is volatile; every other control is answered
@@ -111,8 +67,10 @@ index 69cba17..45b463b 100644
 + * time either control op runs - taking it again would deadlock.  That is also
 + * what serialises this against the debugfs readbacks, which take it explicitly.
 + */
-+static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
-+{
+ static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+ {
+-	pr_debug("id = %x\n", ctrl->id);
+-	return -EINVAL;
 +	struct fthd_private *dev_priv = container_of(ctrl->handler,
 +						     struct fthd_private,
 +						     v4l2_ctrl_handler);
@@ -146,14 +104,13 @@ index 69cba17..45b463b 100644
 +	 * rather than letting it surface as a negative kelvin. */
 +	ctrl->val = clamp_t(u32, cct, FTHD_AWB_CCT_MIN, FTHD_AWB_CCT_MAX);
 +	return 0;
-+}
-+
- static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
--	.g_volatile_ctrl = fthd_g_volatile_ctrl,
+ }
+ 
+ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
+@@ -1556,6 +1627,24 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
  	.s_ctrl = fthd_s_ctrl,
-+	.g_volatile_ctrl = fthd_g_volatile_ctrl,
  };
-+
+ 
 +/*
 + * Read-only, so v4l2_ctrl_handler_setup() skips it and no firmware SET is ever
 + * replayed at STREAMON or after a runtime resume.  That is the structural
@@ -175,7 +132,16 @@ index 69cba17..45b463b 100644
  static void fthd_video_device_release(struct video_device *vdev)
  {
  	struct fthd_private *dev_priv = video_get_drvdata(vdev);
-@@ -1663,6 +1753,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+@@ -1618,7 +1707,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 	if (ret)
+ 		goto fail_vdev_alloc;
+ 
+-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 7);
++	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
+ 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+ 			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
+ 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+@@ -1639,6 +1728,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
  			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
  			       V4L2_EXPOSURE_MANUAL, 0,
  			       V4L2_EXPOSURE_AUTO);

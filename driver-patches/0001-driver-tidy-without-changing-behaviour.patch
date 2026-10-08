@@ -1,0 +1,376 @@
+From 6916681e7c5393e9289b5152651723872bf14870 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 01/21] driver: tidy without changing behaviour
+
+Mechanical cleanup ahead of the functional changes: replace
+__attribute__((packed)) with __packed, strcpy() with strscpy() and
+__FUNCTION__ with __func__; make the file and ioctl operation tables
+const; sleep instead of busy-waiting with mdelay() in paths that may
+sleep; drop includes, declarations and structures nothing uses; fix
+indentation; and give fthd_buffer.h and fthd_isp.h the includes and
+forward declarations they need to stand on their own.
+---
+ fthd_buffer.c | 12 ++----------
+ fthd_buffer.h | 14 ++++++++++----
+ fthd_drv.c    |  8 ++------
+ fthd_isp.c    | 21 ++++++++++-----------
+ fthd_isp.h    | 17 ++++++++++++-----
+ fthd_v4l2.c   | 22 +++++++++-------------
+ 6 files changed, 45 insertions(+), 49 deletions(-)
+
+diff --git a/fthd_buffer.c b/fthd_buffer.c
+index 7687455..543e0a3 100644
+--- a/fthd_buffer.c
++++ b/fthd_buffer.c
+@@ -7,7 +7,6 @@
+  *
+  */
+ 
+-#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/printk.h>
+ #include "fthd_drv.h"
+@@ -15,18 +14,11 @@
+ #include "fthd_hw.h"
+ #include "fthd_buffer.h"
+ 
+-#define GET_IOMMU_PAGES(_x) (((_x) + 4095)/4096)
+-
+-struct buf_ctx {
+-	struct fthd_plane plane[4];
+-	struct isp_mem_obj *isphdr;
+-};
+-
+ static int iommu_allocator_init(struct fthd_private *dev_priv)
+ {
+-        dev_priv->iommu = kzalloc(sizeof(struct resource), GFP_KERNEL);
++	dev_priv->iommu = kzalloc(sizeof(struct resource), GFP_KERNEL);
+ 	if (!dev_priv->iommu)
+-	    return -ENOMEM;
++		return -ENOMEM;
+ 
+ 	dev_priv->iommu->start = 0;
+ 	dev_priv->iommu->end = 4095;
+diff --git a/fthd_buffer.h b/fthd_buffer.h
+index 2e76ded..f924074 100644
+--- a/fthd_buffer.h
++++ b/fthd_buffer.h
+@@ -9,8 +9,14 @@
+ #ifndef FTHD_BUFFER_H
+ #define FTHD_BUFFER_H
+ 
++#include <linux/compiler_attributes.h>
++#include <linux/dma-mapping.h>
++#include <linux/ioport.h>
+ #include <linux/scatterlist.h>
+-#include "fthd_buffer.h"
++
++struct fthd_private;
++struct isp_mem_obj;
++struct vb2_buffer;
+ 
+ enum fthd_buffer_state {
+ 	BUF_FREE,
+@@ -29,14 +35,14 @@ struct dma_descriptor {
+ 	u32 count;
+ 	u32 pool;
+ 	u64 tag;
+-} __attribute__((packed));
++} __packed;
+ 
+ struct dma_descriptor_list {
+ 	u32 field0;
+-    	u32 count;
++	u32 count;
+ 	struct dma_descriptor desc[4];
+ 	char unknown[216];
+-} __attribute__((packed));
++} __packed;
+ 
+ struct iommu_obj {
+ 	struct resource base;
+diff --git a/fthd_drv.c b/fthd_drv.c
+index b85b44d..90cde4c 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -7,7 +7,6 @@
+  *
+  */
+ 
+-#include <linux/delay.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
+@@ -19,8 +18,6 @@
+ #include <linux/interrupt.h>
+ #include <linux/workqueue.h>
+ #include <linux/spinlock.h>
+-#include <linux/sched.h>
+-#include <linux/wait.h>
+ #include <linux/videodev2.h>
+ #include "fthd_drv.h"
+ #include "fthd_hw.h"
+@@ -131,11 +128,10 @@ static void terminal_handler(struct fthd_private *dev_priv,
+ 				 struct fw_channel *chan,
+ 				 u32 entry)
+ {
+-	u32 request_size, response_size, address;
++	u32 request_size, address;
+ 	char buf[512];
+ 
+ 	request_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_REQUEST_SIZE);
+-	response_size = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_RESPONSE_SIZE);
+ 	address = FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & ~ 3;
+ 
+ 	if (!address || !request_size)
+@@ -551,7 +547,7 @@ static int fthd_pci_resume(struct pci_dev *pdev)
+ #endif /* CONFIG_PM */
+ 
+ static const struct pci_device_id fthd_pci_id_table[] = {
+-	{ PCI_DEVICE(0x14e4, 0x1570), 4 },
++	{ PCI_DEVICE(0x14e4, 0x1570) },
+ 	{ 0, },
+ };
+ 
+diff --git a/fthd_isp.c b/fthd_isp.c
+index 8e459ab..bc919dd 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -137,7 +137,7 @@ static int isp_enable_sensor(struct fthd_private *dev_priv)
+ 		dev_warn(&dev_priv->pdev->dev,
+ 			 "ACPI sensor power-on failed (%d), continuing\n", ret);
+ 
+-	mdelay(100); /* wait for sensor power rail to stabilize */
++	msleep(100); /* wait for sensor power rail to stabilize */
+ 
+ 	return 0;
+ }
+@@ -461,7 +461,7 @@ int isp_powerdown(struct fthd_private *dev_priv)
+ 		reg = FTHD_ISP_REG_READ(0xc3000);
+ 		if (reg == 0x8042006)
+ 			break;
+-		mdelay(10);
++		msleep(10);
+ 	}
+ 
+ 	if (retries >= 100) {
+@@ -483,7 +483,7 @@ int isp_uninit(struct fthd_private *dev_priv)
+ 	FTHD_ISP_REG_WRITE(0xffffffff, 0xc1014);
+ 	FTHD_ISP_REG_WRITE(0xffffffff, 0xc101c);
+ 	FTHD_ISP_REG_WRITE(0xffffffff, 0xc1024);
+-	mdelay(1);
++	usleep_range(1000, 2000);
+ 
+ 	FTHD_ISP_REG_WRITE(0, 0xc0000);
+ 	FTHD_ISP_REG_WRITE(0, 0xc0004);
+@@ -665,8 +665,7 @@ int fthd_isp_cmd_camera_config(struct fthd_private *dev_priv)
+ int fthd_isp_cmd_channel_camera_config(struct fthd_private *dev_priv)
+ {
+ 	struct isp_cmd_channel_camera_config cmd;
+-	int ret, len, i;
+-	char prefix[16];
++	int ret = 0, len, i;
+ 	pr_debug("sending ch camera config\n");
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+@@ -677,8 +676,8 @@ int fthd_isp_cmd_channel_camera_config(struct fthd_private *dev_priv)
+ 		ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_CAMERA_CONFIG_GET, &cmd, sizeof(cmd), &len);
+ 		if (ret)
+ 			break;
+-		snprintf(prefix, sizeof(prefix)-1, "CAMCONF%d ", i);
+-		print_hex_dump_bytes(prefix, DUMP_PREFIX_OFFSET, &cmd, sizeof(cmd));
++		print_hex_dump_bytes(i ? "CAMCONF1 " : "CAMCONF0 ",
++				     DUMP_PREFIX_OFFSET, &cmd, sizeof(cmd));
+ 
+ 		/* The first two u16s of the config payload are the sensor's
+ 		 * native width and height (e.g. 1280x720 on MacBookPro,
+@@ -1366,7 +1365,7 @@ int isp_init(struct fthd_private *dev_priv)
+ 		return ret;
+ 
+ 	pci_set_power_state(dev_priv->pdev, PCI_D0);
+-	mdelay(10);
++	msleep(10);
+ 
+ 	isp_enable_sensor(dev_priv);
+ 	FTHD_ISP_REG_WRITE(0, ISP_FW_CHAN_CTRL);
+@@ -1396,7 +1395,7 @@ int isp_init(struct fthd_private *dev_priv)
+ 		reg = FTHD_ISP_REG_READ(ISP_IRQ_STATUS);
+ 		if ((reg & 0xf0) > 0)
+ 			break;
+-		mdelay(10);
++		msleep(10);
+ 	}
+ 
+ 	if (retries >= 1000) {
+@@ -1487,7 +1486,7 @@ int isp_init(struct fthd_private *dev_priv)
+ 			reg = FTHD_ISP_REG_READ(ISP_IRQ_STATUS);
+ 			if ((reg & 0xf0) > 0)
+ 				break;
+-			mdelay(10);
++			msleep(10);
+ 		}
+ 
+ 		if (retries >= 1000) {
+@@ -1518,7 +1517,7 @@ int isp_init(struct fthd_private *dev_priv)
+ 			reg = FTHD_ISP_REG_READ(ISP_FW_HEAP_SIZE);
+ 			if (!reg)
+ 				break;
+-			mdelay(10);
++			msleep(10);
+ 		}
+ 
+ 		if (retries >= 1000) {
+diff --git a/fthd_isp.h b/fthd_isp.h
+index 7ae74b7..997e27b 100644
+--- a/fthd_isp.h
++++ b/fthd_isp.h
+@@ -10,6 +10,13 @@
+ #ifndef _ISP_H
+ #define _ISP_H
+ 
++#include <linux/compiler_attributes.h>
++#include <linux/ioport.h>
++#include <linux/list.h>
++#include <linux/types.h>
++
++struct fthd_private;
++
+ /* ISP memory types */
+ #define FTHD_MEM_FIRMWARE	1
+ #define FTHD_MEM_HEAP		2
+@@ -494,11 +501,11 @@ struct isp_cmd_hdr {
+ 	u32 unknown0;
+ 	u16 opcode;
+ 	u16 status;
+-} __attribute__((packed));
++} __packed;
+ 
+ struct isp_cmd_print_enable {
+ 	u32 enable;
+-} __attribute__((packed));
++} __packed;
+ 
+ struct isp_cmd_config {
+ 	u32 field0;
+@@ -509,13 +516,13 @@ struct isp_cmd_config {
+ 	u32 field14;
+ 	u32 field18;
+ 	u32 field1c;
+-} __attribute__((packed));
++} __packed;
+ 
+ struct isp_cmd_set_loadfile {
+ 	u32 unknown;
+ 	u32 addr;
+ 	u32 length;
+-} __attribute__((packed));
++} __packed;
+ 
+ struct isp_cmd_channel_info {
+ 	u32 field_0;
+@@ -534,7 +541,7 @@ struct isp_cmd_channel_info {
+ 	u8 unknown2[40];
+ 	u8 sensor_serial_number[8];
+ 	u8 camera_module_serial_number[18];
+-} __attribute__((packed));
++} __packed;
+ 
+ struct isp_cmd_channel_camera_config {
+ 	u32 unknown;
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 93ece92..a368d2f 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -10,9 +10,6 @@
+ #include <linux/kernel.h>
+ #include <linux/math64.h>
+ #include <linux/spinlock.h>
+-#include <linux/sched.h>
+-#include <linux/wait.h>
+-#include <linux/delay.h>
+ #include <linux/version.h>
+ #include <linux/videodev2.h>
+ #include <media/v4l2-dev.h>
+@@ -401,7 +398,7 @@ static int fthd_v4l2_release(struct file *filp)
+ 	return ret;
+ }
+ 
+-static struct v4l2_file_operations fthd_vdev_fops = {
++static const struct v4l2_file_operations fthd_vdev_fops = {
+ 	.owner          = THIS_MODULE,
+ 	.open           = fthd_v4l2_open,
+ 
+@@ -419,7 +416,7 @@ static int fthd_v4l2_ioctl_enum_input(struct file *filp, void *priv,
+ 		return -EINVAL;
+ 
+ 	memset(input, 0, sizeof(*input));
+-	strcpy(input->name, "Camera");
++	strscpy(input->name, "Camera", sizeof(input->name));
+ 	input->type = V4L2_INPUT_TYPE_CAMERA;
+ 	input->std = 0;
+ 
+@@ -444,8 +441,8 @@ static int fthd_v4l2_ioctl_querycap(struct file *filp, void *priv,
+ {
+ 	struct fthd_private *dev_priv = video_drvdata(filp);
+ 
+-	strcpy(cap->driver, "facetimehd");
+-	strcpy(cap->card, "Apple Facetime HD");
++	strscpy(cap->driver, "facetimehd", sizeof(cap->driver));
++	strscpy(cap->card, "Apple Facetime HD", sizeof(cap->card));
+ 	snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s",
+ 		 pci_name(dev_priv->pdev));
+ 
+@@ -540,7 +537,7 @@ static int fthd_v4l2_ioctl_try_fmt_vid_cap(struct file *filp, void *_priv,
+ {
+ 	struct fthd_private *dev_priv = video_drvdata(filp);
+ 
+-	pr_debug("%s: %dx%d\n", __FUNCTION__, fmt->fmt.pix.width, fmt->fmt.pix.height);
++	pr_debug("%s: %dx%d\n", __func__, fmt->fmt.pix.width, fmt->fmt.pix.height);
+ 
+ 	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+ 		return -EINVAL;
+@@ -553,7 +550,7 @@ static int fthd_v4l2_ioctl_g_fmt_vid_cap(struct file *filp, void *priv,
+ {
+ 	struct fthd_private *dev_priv = video_drvdata(filp);
+ 
+-	pr_debug("%s\n", __FUNCTION__);
++	pr_debug("%s\n", __func__);
+ 	fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	fmt->fmt.pix = dev_priv->fmt.fmt;
+ 
+@@ -693,7 +690,7 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
+ 	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
+ 	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+ 
+-	pr_debug("%s\n", __FUNCTION__);
++	pr_debug("%s\n", __func__);
+ 
+ 	if (interval->index)
+ 		return -EINVAL;
+@@ -725,7 +722,7 @@ static int fthd_v4l2_ioctl_subscribe_event(struct v4l2_fh *fh,
+ 	return -EINVAL;
+ }
+ 
+-static struct v4l2_ioctl_ops fthd_ioctl_ops = {
++static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
+ 	.vidioc_enum_input      = fthd_v4l2_ioctl_enum_input,
+ 	.vidioc_g_input         = fthd_v4l2_ioctl_g_input,
+ 	.vidioc_s_input         = fthd_v4l2_ioctl_s_input,
+@@ -837,7 +834,6 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 	q->drv_priv = dev_priv;
+ 	q->ops = &vb2_queue_ops;
+ 	q->mem_ops = &vb2_dma_sg_memops;
+-	q->buf_struct_size = 0;//sizeof(struct vpif_cap_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6,8,0)
+ 	q->min_buffers_needed = 1;
+@@ -877,7 +873,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 	dev_priv->alloc_ctx = vb2_dma_sg_init_ctx(&dev_priv->pdev->dev);
+ #endif
+ 	vdev->v4l2_dev = v4l2_dev;
+-	strcpy(vdev->name, "Apple Facetime HD"); // XXX: Length?
++	strscpy(vdev->name, "Apple Facetime HD", sizeof(vdev->name));
+ 	vdev->vfl_dir = VFL_DIR_RX;
+ 	vdev->fops = &fthd_vdev_fops;
+ 	vdev->ioctl_ops = &fthd_ioctl_ops;

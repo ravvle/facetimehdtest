@@ -1,0 +1,236 @@
+From 926defa98a5123040b2dec1b92e7725550453163 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 12/21] v4l2: add anti-banding, switch exposure through the
+ firmware
+
+Add V4L2_CID_POWER_LINE_FREQUENCY (disabled, 50 Hz, 60 Hz) using the
+firmware's flicker-frequency command, and make V4L2_CID_EXPOSURE_AUTO
+start and stop the firmware's auto exposure instead of being a no-op.
+Drop V4L2_CID_EXPOSURE_AUTO_PRIORITY: lowering the AE frame-rate floor
+is not shown to change what the sensor delivers.
+
+Accept control values while the channel is down instead of failing;
+STREAMON replays the handler. Reject unknown controls, and support
+VIDIOC_LOG_STATUS.
+---
+ fthd_drv.h  |  1 -
+ fthd_isp.c  | 45 ++++++++++++++++++++++++++++++---------------
+ fthd_isp.h  | 11 ++++++++++-
+ fthd_v4l2.c | 49 +++++++++++++++++++++++++++++++------------------
+ 4 files changed, 71 insertions(+), 35 deletions(-)
+
+diff --git a/fthd_drv.h b/fthd_drv.h
+index 323ca1e..594e12d 100644
+--- a/fthd_drv.h
++++ b/fthd_drv.h
+@@ -131,7 +131,6 @@ struct fthd_private {
+ 	 * running, so s_ctrl consults this rather than failing when it isn't. */
+ 	bool channel_running;
+ 	u32 frame_rate; /* 1/256 fps */
+-	int exposure_auto_priority;
+ 	unsigned int sequence;
+ 	u64 buffer_tag;
+ 	/* Set when firmware stops answering or violates the streaming protocol,
+diff --git a/fthd_isp.c b/fthd_isp.c
+index ea5ac38..e516ccf 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -1230,6 +1230,26 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
+ 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_SET, &cmd, sizeof(cmd), &len);
+ }
+ 
++/*
++ * Anti-banding.  CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET is one of the
++ * Apple-private opcodes. Firmware reads one word at command offset +0x0c,
++ * confirming this payload layout. The ISP accepted 0, 50 and 60 in hardware
++ * tests; their visible effect still needs a controlled-light comparison.
++ */
++int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq)
++{
++	struct isp_cmd_channel_ae_flicker_freq_set cmd;
++	int len;
++
++	pr_debug("set ae flicker freq %d\n", freq);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.channel = channel;
++	cmd.freq = freq;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
++}
++
+ int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness)
+ {
+ 	struct isp_cmd_channel_brightness_set cmd;
+@@ -1300,22 +1320,18 @@ int fthd_isp_cmd_channel_awb(struct fthd_private *dev_priv, int channel, int ena
+ 	return fthd_isp_cmd(dev_priv, op, &cmd, sizeof(cmd), &len);
+ }
+ 
+-/* Slowest frame rate the auto exposure may fall back to, in 1/256 fps units. */
+-#define FTHD_AE_FPS_MIN		(5 * 256)
+-
+-/*
+- * The auto exposure gathers light by lengthening the exposure, which it can
+- * only do by slowing down. Give it room to do so down to FTHD_AE_FPS_MIN when
+- * the application allows a varying frame rate.
+- */
+-int fthd_isp_ae_frame_rate_min(struct fthd_private *dev_priv, bool auto_priority)
++int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enable)
+ {
+-	int rate = dev_priv->frame_rate;
++	struct isp_cmd_channel cmd;
++	enum fthd_isp_cmds op;
++	int len;
+ 
+-	if (auto_priority && rate > FTHD_AE_FPS_MIN)
+-		rate = FTHD_AE_FPS_MIN;
++	pr_debug("set ae %s\n", enable ? "on" : "off");
+ 
+-	return rate;
++	cmd.channel = channel;
++	op = enable ? CISP_CMD_CH_AE_START : CISP_CMD_CH_AE_STOP;
++	len = sizeof(cmd);
++	return fthd_isp_cmd(dev_priv, op, &cmd, sizeof(cmd), &len);
+ }
+ 
+ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+@@ -1427,8 +1443,7 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+ 	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0, dev_priv->frame_rate);
+ 	if (ret)
+ 		return ret;
+-	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0,
+-						  fthd_isp_ae_frame_rate_min(dev_priv, dev_priv->exposure_auto_priority));
++	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0, dev_priv->frame_rate);
+ 	if (ret)
+ 		return ret;
+ 	ret = fthd_isp_cmd_channel_temporal_filter_start(dev_priv, 0);
+diff --git a/fthd_isp.h b/fthd_isp.h
+index fa77924..982d338 100644
+--- a/fthd_isp.h
++++ b/fthd_isp.h
+@@ -673,6 +673,14 @@ struct isp_cmd_channel_ae_metering_mode_set {
+ 	u32 mode;
+ };
+ 
++/* Firmware opcode 0x8208 reads this 32-bit value at command offset +0x0c.
++ * The accepted values have been hardware-tested; visible anti-banding effect
++ * under controlled lighting remains to be demonstrated. */
++struct isp_cmd_channel_ae_flicker_freq_set {
++	u32 channel;
++	u32 freq;
++};
++
+ struct isp_cmd_channel_start {
+ 	u32 channel;
+ };
+@@ -749,7 +757,6 @@ extern int fthd_isp_cmd_channel_error_handling_config(struct fthd_private *dev_p
+ extern int fthd_isp_cmd_channel_streaming_mode(struct fthd_private *dev_priv, int channel, int mode);
+ extern int fthd_isp_cmd_channel_frame_rate_min(struct fthd_private *dev_priv, int channel, int rate);
+ extern int fthd_isp_cmd_channel_frame_rate_max(struct fthd_private *dev_priv, int channel, int rate);
+-extern int fthd_isp_ae_frame_rate_min(struct fthd_private *dev_priv, bool auto_priority);
+ extern int fthd_isp_cmd_camera_config(struct fthd_private *dev_priv);
+ extern int fthd_isp_cmd_channel_ae_speed_set(struct fthd_private *dev_priv, int channel, int speed);
+ extern int fthd_isp_cmd_channel_ae_stability_set(struct fthd_private *dev_priv, int channel, int stability);
+@@ -765,11 +772,13 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
+ extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_priv, int channel);
+ extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
+ extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
++extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
+ extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
+ extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);
+ extern int fthd_isp_cmd_channel_saturation_set(struct fthd_private *dev_priv, int channel, int saturation);
+ extern int fthd_isp_cmd_channel_hue_set(struct fthd_private *dev_priv, int channel, int hue);
+ extern int fthd_isp_cmd_channel_awb(struct fthd_private *dev_priv, int channel, int hue);
++extern int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enable);
+ extern int fthd_isp_cmd_channel_buffer_return(struct fthd_private *dev_priv, int channel);
+ extern int fthd_start_channel(struct fthd_private *dev_priv, int channel);
+ extern int fthd_stop_channel(struct fthd_private *dev_priv, int channel);
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index baace73..559fce5 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -944,6 +944,8 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
+ 
+ 	.vidioc_subscribe_event	= fthd_v4l2_ioctl_subscribe_event,
+ 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++
++	.vidioc_log_status      = v4l2_ctrl_log_status,
+ };
+ 
+ static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+@@ -955,11 +957,19 @@ static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct fthd_private *dev_priv = container_of(ctrl->handler, struct fthd_private, v4l2_ctrl_handler);
+-	int ret = -EINVAL;
++	int ret;
++
++	pr_debug("id = %x, val = %d\n", ctrl->id, ctrl->val);
+ 
+-	pr_info("id = %x, val = %d\n", ctrl->id, ctrl->val);
++	/* The ISP rejects these while the channel is down.  The control
++	 * framework has already stored the new value, and
++	 * fthd_start_streaming() replays the whole handler once the channel is
++	 * up, so accepting it here is what makes a control set before
++	 * STREAMON take effect rather than fail. */
++	if (!dev_priv->channel_running)
++		return 0;
+ 
+-	switch(ctrl->id) {
++	switch (ctrl->id) {
+ 	case V4L2_CID_CONTRAST:
+ 		ret = fthd_isp_cmd_channel_contrast_set(dev_priv, 0, ctrl->val);
+ 		break;
+@@ -975,20 +985,19 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_AUTO_WHITE_BALANCE:
+ 		ret = fthd_isp_cmd_channel_awb(dev_priv, 0, ctrl->val);
+ 		break;
+-	case V4L2_CID_EXPOSURE_AUTO:
+-		/* The firmware runs auto exposure unconditionally. */
+-		ret = 0;
++	case V4L2_CID_POWER_LINE_FREQUENCY:
++		ret = fthd_isp_cmd_channel_ae_flicker_freq_set(dev_priv, 0,
++				ctrl->val == V4L2_CID_POWER_LINE_FREQUENCY_50HZ ? 50 :
++				ctrl->val == V4L2_CID_POWER_LINE_FREQUENCY_60HZ ? 60 : 0);
+ 		break;
+-	case V4L2_CID_EXPOSURE_AUTO_PRIORITY:
+-		ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0,
+-							  fthd_isp_ae_frame_rate_min(dev_priv, ctrl->val));
+-		if (!ret)
+-			dev_priv->exposure_auto_priority = ctrl->val;
++	case V4L2_CID_EXPOSURE_AUTO:
++		ret = fthd_isp_cmd_channel_ae(dev_priv, 0,
++				ctrl->val == V4L2_EXPOSURE_AUTO);
+ 		break;
+ 	default:
+-		break;
+-
++		return -EINVAL;
+ 	}
++
+ 	pr_debug("ret = %d\n", ret);
+ 	return ret;
+ }
+@@ -1047,12 +1056,16 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 			  V4L2_CID_HUE, 0, 0xff, 1, 0x80);
+ 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+ 			  V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
++	/* Anti-banding.  Defaults to disabled so the ISP keeps the behaviour it
++	 * has always had unless the user asks for their mains frequency. */
+ 	v4l2_ctrl_new_std_menu(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+-			       V4L2_CID_EXPOSURE_AUTO,
+-			       V4L2_EXPOSURE_APERTURE_PRIORITY,
+-			       ~(1 << V4L2_EXPOSURE_AUTO), V4L2_EXPOSURE_AUTO);
+-	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+-			  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
++			       V4L2_CID_POWER_LINE_FREQUENCY,
++			       V4L2_CID_POWER_LINE_FREQUENCY_60HZ, 0,
++			       V4L2_CID_POWER_LINE_FREQUENCY_DISABLED);
++	v4l2_ctrl_new_std_menu(&dev_priv->v4l2_ctrl_handler,
++			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
++			       V4L2_EXPOSURE_MANUAL, 0,
++			       V4L2_EXPOSURE_AUTO);
+ 
+ 	if (dev_priv->v4l2_ctrl_handler.error) {
+ 		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");

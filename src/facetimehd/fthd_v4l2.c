@@ -98,9 +98,7 @@
 /*
  * True when the chroma plane lives at an offset inside the same buffer rather
  * than interleaved with luma.  Derived from the format on every use instead of
- * being cached in a plane count: the vb2 queue is single-planar in every case,
- * and a cached count is exactly what once made queue_setup() ask a
- * V4L2_BUF_TYPE_VIDEO_CAPTURE queue for two planes.
+ * being cached in a plane count: the vb2 queue is single-planar in every case.
  */
 static bool fthd_format_semiplanar(u32 pixelformat)
 {
@@ -117,29 +115,76 @@ static int fthd_buffer_queue_setup(
 
 	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
 	struct v4l2_pix_format *cur_fmt = &dev_priv->fmt.fmt;
-	unsigned int limit;
+	unsigned long budget = 16 * 1024 * 1024;
+	unsigned long size;
+	unsigned int i, allocated, slots, limit;
+	bool create = *nplanes != 0;
 
-	/* This is a single-planar VIDEO_CAPTURE queue. */
-	if (*nplanes) {
-		if (*nplanes != 1)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	allocated = vb2_get_num_buffers(vq);
+	slots = vq->max_num_buffers;
+#else
+	allocated = vq->num_buffers;
+	slots = vq->num_buffers;
+#endif
+	if (create) {
+		if (*nplanes != 1 || sizes[0] < cur_fmt->sizeimage)
 			return -EINVAL;
-		if (sizes[0] < cur_fmt->sizeimage)
-			return -EINVAL;
-		return 0;
+	} else {
+		*nplanes = 1;
+		sizes[0] = cur_fmt->sizeimage;
 	}
 
-	*nplanes = 1;
-	sizes[0] = cur_fmt->sizeimage;
-	alloc_devs[0] = &dev_priv->pdev->dev;
-
-	/* Honour the requested count, at least two, within both the h2t_bufs
-	 * slots and a 16 MiB budget (eight 720p YUYV frames fit). */
-	limit = min_t(unsigned int, FTHD_BUFFERS, (4096 * 4096) / sizes[0]);
-	if (limit < 2)
+	size = PAGE_ALIGN((unsigned long)sizes[0]);
+	if (!size)
 		return -ENOMEM;
-	*nbuffers = clamp_t(unsigned int, *nbuffers, 2, limit);
-	pr_debug("using %d buffers\n", *nbuffers);
 
+	if (create) {
+		/*
+		 * CREATE_BUFS asks for buffers on top of the ones already
+		 * there, so those are charged against the budget and against
+		 * the context count.
+		 */
+		for (i = 0; i < slots; i++) {
+			struct vb2_buffer *vb;
+			unsigned long used;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+			vb = vb2_get_buffer(vq, i);
+#else
+			vb = vq->bufs[i];
+#endif
+			if (!vb)
+				continue;
+			used = PAGE_ALIGN((unsigned long)vb2_plane_size(vb, 0));
+			if (!used || used >= budget)
+				return -ENOMEM;
+			budget -= used;
+		}
+		if (allocated >= FTHD_BUFFERS)
+			return -ENOBUFS;
+		if (size > budget)
+			return -ENOMEM;
+		limit = min_t(unsigned int, FTHD_BUFFERS - allocated,
+			      budget / size);
+		*nbuffers = min(*nbuffers, limit);
+		if (!*nbuffers)
+			return -ENOMEM;
+	} else {
+		/*
+		 * REQBUFS asks for a total. vb2 calls back a second time to
+		 * confirm a partial allocation, and the buffers it asks about
+		 * then are the ones already allocated, so charging them here
+		 * would reject a count that is in fact usable.
+		 */
+		if (size > budget)
+			return -ENOMEM;
+		limit = min_t(unsigned int, FTHD_BUFFERS, budget / size);
+		*nbuffers = min(max(*nbuffers, 2U), limit);
+		if (*nbuffers < 2)
+			return -ENOMEM;
+	}
+
+	alloc_devs[0] = &dev_priv->pdev->dev;
 	return 0;
 }
 
@@ -147,7 +192,7 @@ static int fthd_buffer_queue_setup(
  * Free the ISP-side memory a prepared buffer owns and put its slot back on the
  * free list.  The buffer must no longer be queued to the firmware, and the
  * hardware must still be up: both isp_mem_destroy() and iommu_free() write S2
- * registers, so this cannot run after fthd_pm_down().
+ * registers.
  */
 static void fthd_release_buffer_ctx(struct fthd_private *dev_priv,
 				    struct h2t_buf_ctx *ctx)
@@ -477,14 +522,12 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 				dev_priv->frame_phase = 0;
 		}
 
-		if (deliver) {
-			ctx->state = BUF_ALLOC;
-		} else {
-			ctx->state = BUF_DRV_QUEUED;
-			ctx->requeue = true;
-		}
-	} else
+		/* A decimated buffer stays the driver's, for the requeue worker. */
+		ctx->state = deliver ? BUF_ALLOC : BUF_DRV_QUEUED;
+		ctx->requeue = !deliver;
+	} else {
 		invalid_state = ctx->state;
+	}
 
 	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
 	if (!vb) {
@@ -630,10 +673,7 @@ static int fthd_stream_start(struct fthd_private *dev_priv, bool require_buffers
 	}
 	dev_priv->channel_running = true;
 
-	/* Push the control values the user set while the channel was down.  The
-	 * ISP comes up with its own defaults every time the firmware is
-	 * reloaded, which runtime PM now makes happen on each idle cycle, so
-	 * without this a control set once is forgotten on the next open(). */
+	/* Starting the channel resets the ISP, so push the control values down. */
 	ret = v4l2_ctrl_handler_setup(&dev_priv->v4l2_ctrl_handler);
 	if (ret)
 		goto fail_channel;
@@ -943,7 +983,7 @@ out_unlock:
 	return ret;
 }
 
-static int fthd_v4l2_close(struct file *filp)
+static int fthd_v4l2_release(struct file *filp)
 {
 	struct fthd_private *dev_priv = video_drvdata(filp);
 	int ret;
@@ -959,7 +999,7 @@ static const struct v4l2_file_operations fthd_vdev_fops = {
 	.open           = fthd_v4l2_open,
 
 	.read		= vb2_fop_read,
-	.release        = fthd_v4l2_close,
+	.release        = fthd_v4l2_release,
 	.poll           = vb2_fop_poll,
 	.mmap           = vb2_fop_mmap,
 	.unlocked_ioctl = video_ioctl2
@@ -1157,12 +1197,10 @@ static int fthd_v4l2_ioctl_g_parm(struct file *filp, void *priv,
 	struct fthd_private *dev_priv = video_drvdata(filp);
 
 	/* Always the rate actually delivered: the sensor's fixed FTHD_FPS
-	 * divided by the decimation in force.  Reporting anything else is what
-	 * made GStreamer's pipewiresrc compute negative frame durations and
-	 * stall after one frame (e.g. GNOME Snapshot froze, while ffplay and
-	 * v4l2-ctl were unaffected) back when this returned a 25 fps constant
-	 * against a 30 fps stream.  Expressed as divisor/FTHD_FPS so that rates
-	 * like 7.5 fps stay exact rather than rounding into that same trap. */
+	 * divided by the decimation in force.  A reported rate the stream does
+	 * not match makes GStreamer's pipewiresrc compute negative frame
+	 * durations and stall.  Expressed as divisor/FTHD_FPS so that rates
+	 * like 7.5 fps stay exact. */
 	struct v4l2_fract timeperframe = {
 		.numerator = dev_priv->fps_divisor,
 		.denominator = FTHD_FPS,
@@ -1215,70 +1253,6 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
 	/* Report back what was actually selected, which is what distinguishes
 	 * an accepted rate from a silently ignored one. */
 	return fthd_v4l2_ioctl_g_parm(filp, priv, parm);
-}
-
-static int fthd_v4l2_ioctl_enum_framesizes(struct file *filp, void *priv,
-		struct v4l2_frmsizeenum *sizes)
-{
-	struct fthd_private *dev_priv = video_drvdata(filp);
-
-	if (sizes->index)
-		return -EINVAL;
-
-	if (!fthd_format_supported(sizes->pixel_format))
-		return -EINVAL;
-
-	/* The ISP scales, so every size TRY_FMT accepts has to be enumerated,
-	 * not just the sensor's native one.  The bounds and the width step must
-	 * match fthd_v4l2_adjust_format() exactly. */
-	sizes->type = V4L2_FRMSIZE_TYPE_STEPWISE;
-	sizes->stepwise.min_width   = FTHD_MIN_WIDTH;
-	sizes->stepwise.max_width   = round_down(dev_priv->sensor_width ? : FTHD_MAX_WIDTH, 8);
-	sizes->stepwise.step_width  = 8;
-	sizes->stepwise.min_height  = FTHD_MIN_HEIGHT;
-	sizes->stepwise.max_height  = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
-	sizes->stepwise.step_height = 1;
-
-	return 0;
-}
-
-static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
-		struct v4l2_frmivalenum *interval)
-{
-	struct fthd_private *dev_priv = video_drvdata(filp);
-	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
-	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
-
-	pr_debug("%s\n", __func__);
-
-	if (interval->index)
-		return -EINVAL;
-
-	/* Must agree with ENUM_FMT, or this advertises an interval for a format
-	 * the device does not offer. */
-	if (!fthd_format_supported(interval->pixel_format))
-		return -EINVAL;
-
-	if (interval->width & 7
-	    || interval->width < FTHD_MIN_WIDTH
-	    || interval->width > round_down(max_w, 8)
-	    || interval->height < FTHD_MIN_HEIGHT
-	    || interval->height > max_h)
-		return -EINVAL;
-
-	/* Stepwise, because the rates the driver can deliver are exactly the
-	 * sensor rate divided by a whole number of frames: k/FTHD_FPS for k in
-	 * 1..FTHD_MAX_FPS_DIVISOR.  A discrete list would either omit rates
-	 * S_PARM accepts or advertise ones it cannot hit exactly. */
-	interval->type = V4L2_FRMIVAL_TYPE_STEPWISE;
-	interval->stepwise.min.numerator = 1;
-	interval->stepwise.min.denominator = FTHD_FPS;
-	interval->stepwise.max.numerator = FTHD_MAX_FPS_DIVISOR;
-	interval->stepwise.max.denominator = FTHD_FPS;
-	interval->stepwise.step.numerator = 1;
-	interval->stepwise.step.denominator = FTHD_FPS;
-
-	return 0;
 }
 
 /*
@@ -1445,6 +1419,70 @@ static int fthd_v4l2_ioctl_s_selection(struct file *filp, void *priv,
 	return 0;
 }
 
+static int fthd_v4l2_ioctl_enum_framesizes(struct file *filp, void *priv,
+		struct v4l2_frmsizeenum *sizes)
+{
+	struct fthd_private *dev_priv = video_drvdata(filp);
+
+	if (sizes->index)
+		return -EINVAL;
+
+	if (!fthd_format_supported(sizes->pixel_format))
+		return -EINVAL;
+
+	/* The ISP scales, so every size TRY_FMT accepts has to be enumerated,
+	 * not just the sensor's native one.  The bounds and the width step must
+	 * match fthd_v4l2_adjust_format() exactly. */
+	sizes->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+	sizes->stepwise.min_width  = FTHD_MIN_WIDTH;
+	sizes->stepwise.max_width  = round_down(dev_priv->sensor_width ? : FTHD_MAX_WIDTH, 8);
+	sizes->stepwise.step_width = 8;
+	sizes->stepwise.min_height  = FTHD_MIN_HEIGHT;
+	sizes->stepwise.max_height  = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+	sizes->stepwise.step_height = 1;
+
+	return 0;
+}
+
+static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
+		struct v4l2_frmivalenum *interval)
+{
+	struct fthd_private *dev_priv = video_drvdata(filp);
+	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
+	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+
+	pr_debug("%s\n", __func__);
+
+	if (interval->index)
+		return -EINVAL;
+
+	/* Must agree with ENUM_FMT, or this advertises an interval for a format
+	 * the device does not offer. */
+	if (!fthd_format_supported(interval->pixel_format))
+		return -EINVAL;
+
+	if (interval->width & 7
+	    || interval->width < FTHD_MIN_WIDTH
+	    || interval->width > round_down(max_w, 8)
+	    || interval->height < FTHD_MIN_HEIGHT
+	    || interval->height > max_h)
+		return -EINVAL;
+
+	/* Stepwise, because the rates the driver can deliver are exactly the
+	 * sensor rate divided by a whole number of frames: k/FTHD_FPS for k in
+	 * 1..FTHD_MAX_FPS_DIVISOR.  A discrete list would either omit rates
+	 * S_PARM accepts or advertise ones it cannot hit exactly. */
+	interval->type = V4L2_FRMIVAL_TYPE_STEPWISE;
+	interval->stepwise.min.numerator = 1;
+	interval->stepwise.min.denominator = FTHD_FPS;
+	interval->stepwise.max.numerator = FTHD_MAX_FPS_DIVISOR;
+	interval->stepwise.max.denominator = FTHD_FPS;
+	interval->stepwise.step.numerator = 1;
+	interval->stepwise.step.denominator = FTHD_FPS;
+
+	return 0;
+}
+
 static int fthd_v4l2_ioctl_subscribe_event(struct v4l2_fh *fh,
 		const struct v4l2_event_subscription *sub)
 {
@@ -1469,12 +1507,7 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
 
 
         .vidioc_reqbufs         = vb2_ioctl_reqbufs,
-	/*
-	 * No .vidioc_create_bufs.  It asks for buffers *in addition* to those
-	 * already allocated, which fthd_buffer_queue_setup() does not account
-	 * against the slot and memory limits.  REQBUFS is the supported way to
-	 * size the queue; an optional ioctl reported as unsupported is correct.
-	 */
+	.vidioc_create_bufs     = vb2_ioctl_create_bufs,
 	.vidioc_querybuf        = vb2_ioctl_querybuf,
 	.vidioc_qbuf            = vb2_ioctl_qbuf,
 	.vidioc_dqbuf           = vb2_ioctl_dqbuf,
@@ -1484,17 +1517,62 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
 
 	.vidioc_g_parm          = fthd_v4l2_ioctl_g_parm,
 	.vidioc_s_parm          = fthd_v4l2_ioctl_s_parm,
-	.vidioc_enum_framesizes = fthd_v4l2_ioctl_enum_framesizes,
-	.vidioc_enum_frameintervals = fthd_v4l2_ioctl_enum_frameintervals,
-
 	.vidioc_g_selection     = fthd_v4l2_ioctl_g_selection,
 	.vidioc_s_selection     = fthd_v4l2_ioctl_s_selection,
+	.vidioc_enum_framesizes = fthd_v4l2_ioctl_enum_framesizes,
+	.vidioc_enum_frameintervals = fthd_v4l2_ioctl_enum_frameintervals,
 
 	.vidioc_subscribe_event	= fthd_v4l2_ioctl_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 
 	.vidioc_log_status      = v4l2_ctrl_log_status,
 };
+
+/*
+ * Only FTHD_CID_AWB_CCT_ESTIMATE is volatile; every other control is answered
+ * by the framework from its own cached value and never reaches this.
+ *
+ * No ioctl_lock here.  The control handler hangs off vdev->ctrl_handler and
+ * vdev->lock *is* ioctl_lock, so video_ioctl2() has already taken it by the
+ * time either control op runs - taking it again would deadlock.  That is also
+ * what serialises this against the debugfs readbacks, which take it explicitly.
+ */
+static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct fthd_private *dev_priv = container_of(ctrl->handler,
+						     struct fthd_private,
+						     v4l2_ctrl_handler);
+	u32 cct;
+	int ret;
+
+	if (ctrl->id != FTHD_CID_AWB_CCT_ESTIMATE)
+		return -EINVAL;
+
+	/*
+	 * Nothing to read from an idle ISP, and this must not be the thing that
+	 * powers one up: the read is a diagnostic, not a reason to train DDR and
+	 * re-upload firmware.  Leaving ctrl->val alone reports the last value
+	 * sampled while streaming - zero if there has never been one - which is
+	 * what keeps G_CTRL succeeding for v4l2-compliance and for any
+	 * application that reads controls before STREAMON.
+	 */
+	if (!dev_priv->channel_running)
+		return 0;
+
+	ret = fthd_pm_get(dev_priv);
+	if (ret)
+		return ret;
+	ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &cct);
+	fthd_pm_put(dev_priv);
+	if (ret)
+		return ret;
+
+	/* The firmware field is a u32 and the observed range is a few thousand;
+	 * clamping keeps a nonsensical reading inside the advertised range
+	 * rather than letting it surface as a negative kelvin. */
+	ctrl->val = clamp_t(u32, cct, FTHD_AWB_CCT_MIN, FTHD_AWB_CCT_MAX);
+	return 0;
+}
 
 static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -1544,55 +1622,9 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 	return ret;
 }
 
-/*
- * Only FTHD_CID_AWB_CCT_ESTIMATE is volatile; every other control is answered
- * by the framework from its own cached value and never reaches this.
- *
- * No ioctl_lock here.  The control handler hangs off vdev->ctrl_handler and
- * vdev->lock *is* ioctl_lock, so video_ioctl2() has already taken it by the
- * time either control op runs - taking it again would deadlock.  That is also
- * what serialises this against the debugfs readbacks, which take it explicitly.
- */
-static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
-{
-	struct fthd_private *dev_priv = container_of(ctrl->handler,
-						     struct fthd_private,
-						     v4l2_ctrl_handler);
-	u32 cct;
-	int ret;
-
-	if (ctrl->id != FTHD_CID_AWB_CCT_ESTIMATE)
-		return -EINVAL;
-
-	/*
-	 * Nothing to read from an idle ISP, and this must not be the thing that
-	 * powers one up: the read is a diagnostic, not a reason to train DDR and
-	 * re-upload firmware.  Leaving ctrl->val alone reports the last value
-	 * sampled while streaming - zero if there has never been one - which is
-	 * what keeps G_CTRL succeeding for v4l2-compliance and for any
-	 * application that reads controls before STREAMON.
-	 */
-	if (!dev_priv->channel_running)
-		return 0;
-
-	ret = fthd_pm_get(dev_priv);
-	if (ret)
-		return ret;
-	ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &cct);
-	fthd_pm_put(dev_priv);
-	if (ret)
-		return ret;
-
-	/* The firmware field is a u32 and the observed range is a few thousand;
-	 * clamping keeps a nonsensical reading inside the advertised range
-	 * rather than letting it surface as a negative kelvin. */
-	ctrl->val = clamp_t(u32, cct, FTHD_AWB_CCT_MIN, FTHD_AWB_CCT_MAX);
-	return 0;
-}
-
 static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
-	.s_ctrl = fthd_s_ctrl,
 	.g_volatile_ctrl = fthd_g_volatile_ctrl,
+	.s_ctrl = fthd_s_ctrl,
 };
 
 /*
@@ -1628,7 +1660,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	struct vb2_queue *q;
 	int ret;
 
-	/* Before anything that can fail: the teardown and suspend paths call
+	/* Before anything that can fail: the stop paths call
 	 * cancel_work_sync() on this unconditionally. */
 	INIT_WORK(&dev_priv->requeue_work, fthd_requeue_work);
 

@@ -1,0 +1,74 @@
+From eb41fc30868998779fc929e9b624ce5326e05709 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 05/21] pci: allocate the MSI vector with
+ pci_alloc_irq_vectors()
+
+Use pci_alloc_irq_vectors()/pci_irq_vector()/pci_free_irq_vectors()
+instead of pci_enable_msi() and pdev->irq, and stop requesting the
+interrupt as IRQF_SHARED: a single MSI vector is never shared.
+---
+ fthd_drv.c | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/fthd_drv.c b/fthd_drv.c
+index 044cc66..4992e7b 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -218,7 +218,7 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
+ 
+ static void fthd_irq_uninstall(struct fthd_private *dev_priv)
+ {
+-	free_irq(dev_priv->pdev->irq, dev_priv);
++	free_irq(pci_irq_vector(dev_priv->pdev, 0), dev_priv);
+ }
+ 
+ static void fthd_irq_work(struct work_struct *work)
+@@ -283,7 +283,8 @@ static int fthd_irq_install(struct fthd_private *dev_priv)
+ {
+ 	int ret;
+ 
+-	ret = request_irq(dev_priv->pdev->irq, fthd_irq_handler, IRQF_SHARED,
++	/* A single MSI vector is never shared with another device. */
++	ret = request_irq(pci_irq_vector(dev_priv->pdev, 0), fthd_irq_handler, 0,
+ 			  KBUILD_MODNAME, (void *)dev_priv);
+ 
+ 	if (ret)
+@@ -340,7 +341,7 @@ static void fthd_pci_remove(struct pci_dev *pdev)
+ 
+ 	fthd_buffer_exit(dev_priv);
+ 
+-	pci_disable_msi(pdev);
++	pci_free_irq_vectors(pdev);
+ 
+ 	if (dev_priv->s2_io)
+ 		iounmap(dev_priv->s2_io);
+@@ -377,8 +378,8 @@ static int fthd_pci_init(struct fthd_private *dev_priv)
+ 	if (ret)
+ 		goto fail_enable;
+ 
+-	ret = pci_enable_msi(pdev);
+-	if (ret) {
++	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
++	if (ret < 0) {
+ 		dev_err(&pdev->dev, "Failed to enable MSI\n");
+ 		goto fail_reserve;
+ 	}
+@@ -403,7 +404,7 @@ static int fthd_pci_init(struct fthd_private *dev_priv)
+ fail_irq:
+ 	fthd_irq_uninstall(dev_priv);
+ fail_msi:
+-	pci_disable_msi(pdev);
++	pci_free_irq_vectors(pdev);
+ fail_reserve:
+ 	pci_release_region(pdev, FTHD_PCI_S2_IO);
+ 	pci_release_region(pdev, FTHD_PCI_S2_MEM);
+@@ -510,7 +511,7 @@ fail_buffer:
+ 	fthd_buffer_exit(dev_priv);
+ fail_pci:
+ 	fthd_irq_uninstall(dev_priv);
+-	pci_disable_msi(pdev);
++	pci_free_irq_vectors(pdev);
+ 	pci_release_region(pdev, FTHD_PCI_S2_IO);
+ 	pci_release_region(pdev, FTHD_PCI_S2_MEM);
+ 	pci_release_region(pdev, FTHD_PCI_ISP_IO);

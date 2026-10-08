@@ -16,7 +16,8 @@ Hardware results are from a MacBookAir7,2 with firmware 1.43.0 unless stated;
 - Odd-width-at-odd-offset crops refused.
 - Stepwise frame sizes with an 8-pixel step.
 - YVYU withdrawn.
-- Up to eight buffers within 16 MiB.
+- Up to eight buffers within 16 MiB, and `VIDIOC_CREATE_BUFS` accounted
+  against the same limits.
 - A 200 ms AE settle.
 - Buffers returned when channel start fails.
 
@@ -158,8 +159,6 @@ Upstream has no `S_SELECTION`, and its `G_SELECTION` lacks the `CROP` target.
   `0x1001`/`0x1002` are deliberately unused.
 - Controls are also replayed after runtime and system resume.
 - `VIDIOC_LOG_STATUS` is supported.
-- `VIDIOC_CREATE_BUFS` is not advertised: `queue_setup()` does not account
-  added buffers against the slot and memory limits. Upstream supports it.
 
 **No firmware setter is registered as a V4L2 control unless its payload is
 proven.** `v4l2_ctrl_handler_setup()` sends every registered control's
@@ -244,7 +243,7 @@ replayed.
   the programmed `(x, y, width, height)`.
 
 **Not yet run on hardware since the last driver change:**
-- Eight queued buffers (`v4l2-ctl` queues four).
+- Eight queued buffers (`v4l2-ctl` queues four), and `VIDIOC_CREATE_BUFS`.
 - The 200 ms AE settle, as distinct from a later frame. Both were validated
   upstream on other models.
 

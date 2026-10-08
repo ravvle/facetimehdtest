@@ -1,0 +1,474 @@
+From c0f4f06ac250e26a426d90a3e58aa4d064bc4875 Mon Sep 17 00:00:00 2001
+From: facetimehd downstream <facetimehd-downstream@localhost>
+Date: Thu, 8 Oct 2026 12:00:00 +1000
+Subject: [PATCH 03/21] driver: quieten bring-up logging, report failures as
+ errors
+
+The PLL, DDR and ISP bring-up messages read like once-per-boot banners
+but run on every firmware load, so make them dev_dbg and print a single
+"camera ready" line at probe instead. FWMSG, the firmware's own console,
+arrives per message while streaming and becomes dev_dbg too. Messages
+that report a failure move the other way, from dev_info to dev_err, and
+the remaining pr_err() calls become dev_err() so they name the device.
+---
+ fthd_drv.c  | 23 +++++++++++-----
+ fthd_hw.c   | 76 ++++++++++++++++++++++++++---------------------------
+ fthd_isp.c  | 46 ++++++++++++++++----------------
+ fthd_v4l2.c |  6 ++---
+ 4 files changed, 80 insertions(+), 71 deletions(-)
+
+diff --git a/fthd_drv.c b/fthd_drv.c
+index b102919..044cc66 100644
+--- a/fthd_drv.c
++++ b/fthd_drv.c
+@@ -100,7 +100,7 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
+ 
+ 		ret = fthd_channel_ringbuf_send(dev_priv, chan, 0, 0, 0, NULL);
+ 		if (ret)
+-			pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
++			dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 	} else {
+ 		if (!request_size)
+ 			return;
+@@ -114,7 +114,7 @@ static void sharedmalloc_handler(struct fthd_private *dev_priv,
+ 		FTHD_S2_MEMCPY_TOIO(obj->offset, &obj, sizeof(obj));
+ 		ret = fthd_channel_ringbuf_send(dev_priv, chan, obj->offset + 64, 0, 0, NULL);
+ 		if (ret)
+-			pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
++			dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 
+ 	}
+ 
+@@ -137,7 +137,11 @@ static void terminal_handler(struct fthd_private *dev_priv,
+ 	if (request_size > 512)
+ 		request_size = 512;
+ 	FTHD_S2_MEMCPY_FROMIO(buf, address, request_size);
+-	pr_info("FWMSG: %.*s", request_size, buf);
++	/* The firmware's own console. Interesting when debugging the ISP,
++	 * noise the rest of the time - and it arrives per firmware message,
++	 * so at dev_info it is the single largest contributor to the log
++	 * volume this driver produces while streaming. */
++	dev_dbg(&dev_priv->pdev->dev, "FWMSG: %.*s", request_size, buf);
+ }
+ 
+ static void buf_t2h_handler(struct fthd_private *dev_priv,
+@@ -158,7 +162,7 @@ static void buf_t2h_handler(struct fthd_private *dev_priv,
+ 	ret = fthd_channel_ringbuf_send(dev_priv, chan, (response_size & 0x10000000) ? address : 0,
+ 					0, 0x80000000, NULL);
+ 	if (ret)
+-		pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
++		dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 
+ }
+ 
+@@ -168,7 +172,7 @@ static void io_t2h_handler(struct fthd_private *dev_priv,
+ {
+ 	int ret = fthd_channel_ringbuf_send(dev_priv, chan, 0, 0, 0, NULL);
+ 	if (ret)
+-		pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
++		dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 
+ }
+ 
+@@ -203,7 +207,7 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
+ 			terminal_handler(dev_priv, chan, entry);
+ 			ret = fthd_channel_ringbuf_send(dev_priv, chan, 0, 0, 0, NULL);
+ 			if (ret)
+-				pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
++				dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 		} else if (chan == dev_priv->channel_buf_t2h) {
+ 			buf_t2h_handler(dev_priv, chan, entry);
+ 		} else if (chan == dev_priv->channel_io_t2h) {
+@@ -390,7 +394,7 @@ static int fthd_pci_init(struct fthd_private *dev_priv)
+ 	if (ret)
+ 		goto fail_irq;
+ 
+-	dev_info(&pdev->dev, "Setting %ubit DMA mask\n", dev_priv->dma_mask);
++	dev_dbg(&pdev->dev, "Setting %ubit DMA mask\n", dev_priv->dma_mask);
+ 
+ 	pci_set_master(pdev);
+ 	pci_set_drvdata(pdev, dev_priv);
+@@ -490,6 +494,11 @@ static int fthd_pci_probe(struct pci_dev *pdev,
+ 	ret = fthd_debugfs_init(dev_priv);
+ 	if (ret)
+ 		goto fail_v4l2;
++
++	/* One line per probe, carrying what the twenty-line bring-up banner
++	 * used to be read for; everything else on that path is dev_dbg. */
++	dev_info(&pdev->dev, "camera ready: DDR %u MHz, %u-bit DMA\n",
++		 dev_priv->ddr_speed, dev_priv->dma_mask);
+ 	return 0;
+ fail_v4l2:
+ 	fthd_v4l2_unregister(dev_priv);
+diff --git a/fthd_hw.c b/fthd_hw.c
+index 9fe357c..0f0ed8b 100644
+--- a/fthd_hw.c
++++ b/fthd_hw.c
+@@ -24,7 +24,7 @@ static int fthd_hw_s2_pll_reset(struct fthd_private *dev_priv)
+ 
+ 	FTHD_S2_REG_WRITE(0x3, S2_PLL_CTRL_14);
+ 
+-	dev_info(&dev_priv->pdev->dev, "PLL reset finished\n");
++	dev_dbg(&dev_priv->pdev->dev, "PLL reset finished\n");
+ 
+ 	return 0;
+ }
+@@ -49,7 +49,7 @@ static int fthd_hw_s2_init_pcie_link(struct fthd_private *dev_priv)
+ 	}
+ 
+ 	/* PLL is powered down */
+-	dev_info(&dev_priv->pdev->dev, "S2 PCIe link init succeeded\n");
++	dev_dbg(&dev_priv->pdev->dev, "S2 PCIe link init succeeded\n");
+ 
+ 	FTHD_S2_REG_WRITE(0x1f08, S2_PCIE_LINK_D128);
+ 	FTHD_S2_REG_WRITE(0x80008610, S2_PCIE_LINK_D12C);
+@@ -73,9 +73,9 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
+ 	ref_clk_25 = reg & S2_PLL_REFCLK_25MHZ ? 1 : 0;
+ 
+ 	if (ref_clk_25)
+-		dev_info(&dev_priv->pdev->dev, "Refclk: 25MHz (0x%x)\n", reg);
++		dev_dbg(&dev_priv->pdev->dev, "Refclk: 25MHz (0x%x)\n", reg);
+ 	else
+-		dev_info(&dev_priv->pdev->dev, "Refclk: 24MHz (0x%x\n", reg);
++		dev_dbg(&dev_priv->pdev->dev, "Refclk: 24MHz (0x%x\n", reg);
+ 
+ 	if (ddr_speed == 400) {
+ 		if (ref_clk_25) {
+@@ -129,8 +129,8 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
+ 
+ 	fthd_hw_s2_pll_reset(dev_priv);
+ 
+-	dev_info(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
+-		 ddr_speed);
++	dev_dbg(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
++		ddr_speed);
+ 
+ 	do {
+ 		reg = FTHD_S2_REG_READ(S2_PLL_CMU_STATUS);
+@@ -139,12 +139,12 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
+ 	} while (!(reg & S2_PLL_CMU_STATUS_LOCKED) && retries <= 10000);
+ 
+ 	if (retries > 10000) {
+-		dev_info(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
+-			 reg);
++		dev_err(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
++			reg);
+ 		return -EINVAL;
+ 	} else {
+-		dev_info(&dev_priv->pdev->dev, "S2 PLL is locked after %d us\n",
+-			 (retries * 10));
++		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is locked after %d us\n",
++			(retries * 10));
+ 	}
+ 
+ 	reg = FTHD_S2_REG_READ(S2_PLL_STATUS_A8);
+@@ -153,9 +153,9 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
+ 
+ 	reg = FTHD_S2_REG_READ(S2_PLL_STATUS_A8);
+ 	if (reg & S2_PLL_BYPASS)
+-		dev_info(&dev_priv->pdev->dev, "S2 PLL is in bypass mode\n");
++		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is in bypass mode\n");
+ 	else
+-		dev_info(&dev_priv->pdev->dev, "S2 PLL is in non-bypass mode\n");
++		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is in non-bypass mode\n");
+ 
+ 	return 0;
+ }
+@@ -246,8 +246,8 @@ static int fthd_hw_ddr_rewrite_mode_regs(struct fthd_private *dev_priv)
+ 	if (ret != 0)
+ 		return ret;
+ 
+-	dev_info(&dev_priv->pdev->dev,
+-		 "Rewrite DDR mode registers succeeded\n");
++	dev_dbg(&dev_priv->pdev->dev,
++		"Rewrite DDR mode registers succeeded\n");
+ 
+ 	return 0;
+ }
+@@ -344,8 +344,8 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 		return -EIO;
+ 	}
+ 
+-	dev_info(&dev_priv->pdev->dev,
+-		 "DDR40 PHY PLL locked on safe settings\n");
++	dev_dbg(&dev_priv->pdev->dev,
++		"DDR40 PHY PLL locked on safe settings\n");
+ 
+ 	/* Default is DDR model 4 */
+ 	switch (dev_priv->ddr_model) {
+@@ -400,7 +400,7 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 			"Timeout waiting for STRAP valid\n");
+ 		return -ENODEV;
+ 	} else {
+-		dev_info(&dev_priv->pdev->dev, "STRAP valid\n");
++		dev_dbg(&dev_priv->pdev->dev, "STRAP valid\n");
+ 	}
+ 
+ 	/* Manual DDR40 PHY init */
+@@ -410,8 +410,8 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 			 dev_priv->ddr_speed);
+ 	}
+ 
+-	dev_info(&dev_priv->pdev->dev,
+-		 "Configuring DDR PLLs for %u MHz\n", dev_priv->ddr_speed);
++	dev_dbg(&dev_priv->pdev->dev,
++		"Configuring DDR PLLs for %u MHz\n", dev_priv->ddr_speed);
+ 
+ 	if ((dev_priv->ddr_speed * 2) < 500)
+ 		val = 0x2040;
+@@ -443,7 +443,7 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 		return -ENODEV;
+ 	}
+ 
+-	dev_info(&dev_priv->pdev->dev, "DDR40 PLL is locked after %d us\n", i);
++	dev_dbg(&dev_priv->pdev->dev, "DDR40 PLL is locked after %d us\n", i);
+ 
+ 	/* Configure DDR40 VDL */
+ 	FTHD_S2_REG_WRITE(0, S2_DDR40_PHY_VDL_CTL);
+@@ -458,12 +458,12 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 	}
+ 
+ 	if (reg & 0x1) {
+-		dev_info(&dev_priv->pdev->dev,
+-			 "First DDR40 VDL calibration completed after %d us",
+-			 i);
++		dev_dbg(&dev_priv->pdev->dev,
++			"First DDR40 VDL calibration completed after %d us",
++			i);
+ 
+ 		if ((reg & 0x2) == 0) {
+-			dev_info(&dev_priv->pdev->dev,
++			dev_warn(&dev_priv->pdev->dev,
+ 				 "...but failed to lock\n");
+ 		}
+ 
+@@ -483,20 +483,20 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 		udelay(1);
+ 	}
+ 
+-	dev_info(&dev_priv->pdev->dev,
+-		 "Second DDR40 VDL calibration completed after %d us\n", i);
++	dev_dbg(&dev_priv->pdev->dev,
++		"Second DDR40 VDL calibration completed after %d us\n", i);
+ 
+ 	if (reg & 0x2) {
+ 		step_size = (reg & S2_DDR40_PHY_VDL_STEP_MASK) >>
+ 			    S2_DDR40_PHY_VDL_STEP_SHIFT;
+-		dev_info(&dev_priv->pdev->dev, "Using step size %u\n",
+-			 step_size);
++		dev_dbg(&dev_priv->pdev->dev, "Using step size %u\n",
++			step_size);
+ 	} else {
+ 
+ 		val = 1000000 / dev_priv->ddr_speed;
+ 		step_size = (val * 0x4ec4ec4f) >> 22;
+-		dev_info(&dev_priv->pdev->dev, "Using default step size (%u)\n",
+-			 step_size);
++		dev_dbg(&dev_priv->pdev->dev, "Using default step size (%u)\n",
++			step_size);
+ 	}
+ 
+ 	dev_priv->vdl_step_size = step_size;
+@@ -524,9 +524,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 
+ 		FTHD_S2_REG_WRITE(vdl_coarse, S2_DDR40_PHY_VDL_OVR_COARSE);
+ 
+-		dev_info(&dev_priv->pdev->dev,
+-			 "VDL set to: coarse=0x%x, fine=0x%x\n",
+-			 vdl_coarse, vdl_fine);
++		dev_dbg(&dev_priv->pdev->dev,
++			"VDL set to: coarse=0x%x, fine=0x%x\n",
++			vdl_coarse, vdl_fine);
+ 	}
+ 
+ 	/* Configure Virtual VTT connections and override */
+@@ -539,7 +539,7 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 
+ 	FTHD_S2_REG_WRITE(0x4, S2_DDR40_PHY_VTT_CTL);
+ 
+-	dev_info(&dev_priv->pdev->dev, "Virtual VTT enabled");
++	dev_dbg(&dev_priv->pdev->dev, "Virtual VTT enabled");
+ 
+ 	/* Process, Voltage and Temperature compensation */
+ 	FTHD_S2_REG_WRITE(0xc0fff, S2_DDR40_PHY_ZQ_PVT_COMP_CTL);
+@@ -582,8 +582,8 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
+ 
+ 	/* Read DRAM mem address (FIXME: Need to mask a few bits here) */
+ 	reg = FTHD_S2_REG_READ(S2_DDR40_STRAP_STATUS);
+-	dev_info(&dev_priv->pdev->dev,
+-		 "S2 DRAM memory address: 0x%08x\n", reg);
++	dev_dbg(&dev_priv->pdev->dev,
++		"S2 DRAM memory address: 0x%08x\n", reg);
+ 
+ 	switch (dev_priv->ddr_model) {
+ 	case 4:
+@@ -702,7 +702,7 @@ int fthd_hw_init(struct fthd_private *dev_priv)
+ 	if (ret)
+ 	    goto out;
+ 
+-	dev_info(&dev_priv->pdev->dev, "Enabling interrupts\n");
++	dev_dbg(&dev_priv->pdev->dev, "Enabling interrupts\n");
+ 	fthd_irq_enable(dev_priv);
+ out:
+ 	return ret;
+@@ -710,7 +710,7 @@ out:
+ 
+ void fthd_hw_deinit(struct fthd_private *dev_priv)
+ {
+-	dev_info(&dev_priv->pdev->dev, "%s", __FUNCTION__);
++	dev_dbg(&dev_priv->pdev->dev, "%s", __func__);
+ 	FTHD_ISP_REG_WRITE(0, ISP_REG_41020);
+ 	fthd_irq_disable(dev_priv);
+ }
+diff --git a/fthd_isp.c b/fthd_isp.c
+index bc919dd..1b12dac 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -168,8 +168,8 @@ static int isp_load_firmware(struct fthd_private *dev_priv)
+ 
+ 	/* Might need a flush here if we map ISP memory cached */
+ 
+-	dev_info(&dev_priv->pdev->dev, "Loaded firmware, size: %lukb\n",
+-		 fw->size / 1024);
++	dev_dbg(&dev_priv->pdev->dev, "Loaded firmware, size: %lukb\n",
++		fw->size / 1024);
+ 
+ 	release_firmware(fw);
+ 
+@@ -465,7 +465,7 @@ int isp_powerdown(struct fthd_private *dev_priv)
+ 	}
+ 
+ 	if (retries >= 100) {
+-		dev_info(&dev_priv->pdev->dev, "deinit failed!\n");
++		dev_err(&dev_priv->pdev->dev, "deinit failed!\n");
+ 		return -EIO;
+ 	}
+ 	return 0;
+@@ -617,7 +617,7 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
+ 		dev_warn(&dev_priv->pdev->dev,
+ 			 "set file load failed (%d), continuing without calibration\n", ret);
+ 	else
+-		dev_info(&dev_priv->pdev->dev, "loaded set file %s\n", filename);
++		dev_dbg(&dev_priv->pdev->dev, "loaded set file %s\n", filename);
+ 	return 0;
+ }
+ 
+@@ -1399,25 +1399,25 @@ int isp_init(struct fthd_private *dev_priv)
+ 	}
+ 
+ 	if (retries >= 1000) {
+-		dev_info(&dev_priv->pdev->dev, "Init failed! No wake signal\n");
++		dev_err(&dev_priv->pdev->dev, "Init failed! No wake signal\n");
+ 		return -EIO;
+ 	}
+ 
+-	dev_info(&dev_priv->pdev->dev, "ISP woke up after %dms\n",
+-		 (retries - 1) * 10);
++	dev_dbg(&dev_priv->pdev->dev, "ISP woke up after %dms\n",
++		(retries - 1) * 10);
+ 
+ 	FTHD_ISP_REG_WRITE(0xffffffff, ISP_IRQ_CLEAR);
+ 
+ 	num_channels = FTHD_ISP_REG_READ(ISP_FW_CHAN_CTRL);
+ 	queue_size = FTHD_ISP_REG_READ(ISP_FW_QUEUE_CTRL) + 1;
+ 
+-	dev_info(&dev_priv->pdev->dev,
+-		 "Number of IPC channels: %u, queue size: %u\n",
+-		 num_channels, queue_size);
++	dev_dbg(&dev_priv->pdev->dev,
++		"Number of IPC channels: %u, queue size: %u\n",
++		num_channels, queue_size);
+ 
+ 	if (num_channels > 32) {
+-		dev_info(&dev_priv->pdev->dev, "Too many IPC channels: %u\n",
+-			 num_channels);
++		dev_err(&dev_priv->pdev->dev, "Too many IPC channels: %u\n",
++			num_channels);
+ 		return -EIO;
+ 	}
+ 
+@@ -1441,14 +1441,14 @@ int isp_init(struct fthd_private *dev_priv)
+ 		heap_size = (heap_size < 0x1000) ? 0x1000 : heap_size;
+ 
+ 		if (heap_size > 0x400000) {
+-			dev_info(&dev_priv->pdev->dev,
+-				 "Firmware heap request size too big (%ukb)\n",
+-				 heap_size / 1024);
++			dev_err(&dev_priv->pdev->dev,
++				"Firmware heap request size too big (%ukb)\n",
++				heap_size / 1024);
+ 			return -ENOMEM;
+ 		}
+ 
+-		dev_info(&dev_priv->pdev->dev, "Firmware requested heap size: %ukb\n",
+-			 heap_size / 1024);
++		dev_dbg(&dev_priv->pdev->dev, "Firmware requested heap size: %ukb\n",
++			heap_size / 1024);
+ 
+ 		heap = isp_mem_create(dev_priv, FTHD_MEM_HEAP, heap_size);
+ 		if (!heap)
+@@ -1490,15 +1490,15 @@ int isp_init(struct fthd_private *dev_priv)
+ 		}
+ 
+ 		if (retries >= 1000) {
+-			dev_info(&dev_priv->pdev->dev, "Init failed! No second int\n");
++			dev_err(&dev_priv->pdev->dev, "Init failed! No second int\n");
+ 			return -EIO;
+ 		} /* FIXME: free on error path */
+ 
+-		dev_info(&dev_priv->pdev->dev, "ISP second int after %dms\n",
+-			 (retries - 1) * 10);
++		dev_dbg(&dev_priv->pdev->dev, "ISP second int after %dms\n",
++			(retries - 1) * 10);
+ 
+ 		offset = FTHD_ISP_REG_READ(ISP_FW_CHAN_CTRL);
+-		dev_info(&dev_priv->pdev->dev, "Channel description table at %08x\n", offset);
++		dev_dbg(&dev_priv->pdev->dev, "Channel description table at %08x\n", offset);
+ 		ret = isp_fill_channel_info(dev_priv, offset, num_channels);
+ 		if (ret)
+ 			return ret;
+@@ -1521,11 +1521,11 @@ int isp_init(struct fthd_private *dev_priv)
+ 		}
+ 
+ 		if (retries >= 1000) {
+-			dev_info(&dev_priv->pdev->dev, "Init failed! No magic value\n");
++			dev_err(&dev_priv->pdev->dev, "Init failed! No magic value\n");
+ 			isp_uninit(dev_priv);
+ 			return -EIO;
+ 		} /* FIXME: free on error path */
+-		dev_info(&dev_priv->pdev->dev, "magic value: %08x after %d ms\n", reg, (retries - 1) * 10);
++		dev_dbg(&dev_priv->pdev->dev, "magic value: %08x after %d ms\n", reg, (retries - 1) * 10);
+ 	}
+ 
+ 	return 0;
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index 4fbe6fa..1da1693 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -150,7 +150,7 @@ static int fthd_send_h2t_buffer(struct fthd_private *dev_priv, struct h2t_buf_ct
+ 					ctx->dma_desc_obj->offset, 0x180, 0x30000000, &entry);
+ 
+ 	if (ret) {
+-		pr_err("%s: fthd_channel_ringbuf_send: %d\n", __FUNCTION__, ret);
++		dev_err(&dev_priv->pdev->dev, "%s: fthd_channel_ringbuf_send: %d\n", __func__, ret);
+ 		return ret;
+ 	}
+ 	return fthd_channel_wait_ready(dev_priv, dev_priv->channel_buf_h2t, entry, 2000);
+@@ -789,7 +789,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 
+ 	ret = v4l2_device_register(&dev_priv->pdev->dev, v4l2_dev);
+ 	if (ret) {
+-		pr_err("v4l2_device_register: %d\n", ret);
++		dev_err(&dev_priv->pdev->dev, "v4l2_device_register: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+@@ -840,7 +840,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 			  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+ 
+ 	if (dev_priv->v4l2_ctrl_handler.error) {
+-		pr_err("failed to setup control handlers\n");
++		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");
+ 		v4l2_ctrl_handler_free(&dev_priv->v4l2_ctrl_handler);
+ 		goto fail;
+ 	}

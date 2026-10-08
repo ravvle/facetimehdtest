@@ -369,21 +369,18 @@ out:
 }
 
 /*
- * Shared body of fthd_isp_cmd() and fthd_isp_debug_cmd(). @chan and @timeout_ms
- * are the only things that differ between the IO and debug channel variants,
- * plus the debug channel never sends CISP_CMD_POWER_DOWN and logs its status
- * line at a different level - both are gated on @is_debug.
+ * Shared body of fthd_isp_cmd() and fthd_isp_debug_cmd().  Besides @chan and
+ * @timeout_ms, @is_debug selects the debug channel's differences: it never
+ * sends CISP_CMD_POWER_DOWN and it ignores cmd.status.
  *
  * A command that never gets an answer - fthd_channel_wait_ready() timing out -
  * means the firmware is not responding and may still complete this command
  * later into memory nothing else has claimed. The request object is
  * deliberately not freed in that case: it is left on dev_priv->mem_objects,
  * which keeps the allocator from ever handing its offset to anyone else, and
- * it is reclaimed in bulk by isp_mem_destroy_all() the next time
- * fthd_pm_down() tears the ISP down. @dev_priv->wedged is set so every
- * further command fails fast instead of piling up more multi-second
- * timeouts; it is cleared in fthd_pm_down() once the hardware and every
- * outstanding object are gone.
+ * isp_mem_destroy_all() reclaims it when the ISP is next torn down.
+ * @dev_priv->wedged is set so every further command fails fast instead of
+ * piling up more multi-second timeouts, until the firmware is reloaded.
  *
  * Once a command is in the hardware ring it cannot be cancelled. Its bounded
  * completion wait must therefore not be interruptible by a userspace signal:
@@ -502,11 +499,6 @@ static int __fthd_isp_cmd(struct fthd_private *dev_priv, struct fw_channel *chan
 	dev_dbg(&dev_priv->pdev->dev,
 		"status %04x, request_len %d response len %d address_flags %x\n",
 		cmd.status, request_size, response_size, address);
-	/* Debug-channel commands have always ignored cmd.status; upstream left
-	 * no reason why, and nothing here can retest it blind, so the
-	 * behaviour is preserved exactly. Only the log level changed: the two
-	 * branches printed the same line at different levels, which meant the
-	 * debug channel was the louder of the two. */
 	ret = is_debug ? 0 : (cmd.status ? -EIO : 0);
 out_free:
 	isp_mem_destroy(request);
@@ -638,18 +630,13 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 	struct isp_mem_obj *file;
 	const struct firmware *fw;
 	const char *filename = NULL;
-	const char *vendor, *board;
+	const char *vendor, *model;
 	int ret = 0;
 
 	pr_debug("set loadfile\n");
 
 	vendor = dmi_get_system_info(DMI_SYS_VENDOR);
-	/* DMI_PRODUCT_NAME, not DMI_BOARD_NAME.  Apple puts the model here
-	 * ("MacBookAir7,2") and the board ID in DMI_BOARD_NAME
-	 * ("Mac-937CB26E2E02BB01"), so the MacBookAir test below could never
-	 * match: every Air fell through to the sensor_id0 switch and asked for
-	 * 1871_01XX.dat when it wanted 1771_01XX.dat. */
-	board = dmi_get_system_info(DMI_PRODUCT_NAME);
+	model = dmi_get_system_info(DMI_PRODUCT_NAME);
 
 	memset(&cmd, 0, sizeof(cmd));
 
@@ -661,9 +648,7 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 		filename = "facetimehd/1222_01XX.dat";
 		break;
 	case 0x248:
-		/* MacBookPro14,1 reports 0005 0248.  Apple's Windows driver picks
-		 * on sensor_id0 >> 4 here, not sensor_id0. */
-		switch (dev_priv->sensor_id0 >> 4) {
+		switch(dev_priv->sensor_id0 >> 4) {
 		case 5:
 			filename = "facetimehd/1575_01XX.dat";
 			break;
@@ -676,8 +661,8 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 		filename = "facetimehd/9112_01XX.dat";
 		break;
 	case 0x9770:
-		if (vendor && board && !strcmp(vendor, "Apple Inc.") &&
-		    !strncmp(board, "MacBookAir", sizeof("MacBookAir")-1)) {
+		if (vendor && model && !strcmp(vendor, "Apple Inc.") &&
+		    !strncmp(model, "MacBookAir", sizeof("MacBookAir") - 1)) {
 			filename = "facetimehd/1771_01XX.dat";
 			break;
 		}
@@ -710,21 +695,17 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 	}
 
 	if (!filename) {
-		pr_debug("no set file for sensorid %04x %04x found\n",
+		dev_info(&dev_priv->pdev->dev,
+			 "no set file for sensor %04x %04x, continuing without calibration\n",
 			 dev_priv->sensor_id0, dev_priv->sensor_id1);
 		return 0;
 	}
 
-	/* The set file is allowed to be missing - the camera still works, only
-	 * its colours are off - but that has to be visible somewhere other than
-	 * a silent 0 return, or nothing ever tells the user which file their
-	 * machine wanted. extract-firmware.sh does not yet produce every name
-	 * MODULE_FIRMWARE lists above; see README.md, "Firmware and sensor
-	 * calibration". */
+	/* The set file is allowed to be missing but we don't get calibration */
 	ret = request_firmware(&fw, filename, &dev_priv->pdev->dev);
 	if (ret) {
 		dev_info(&dev_priv->pdev->dev,
-			 "no sensor calibration file %s; colours may be off (see README.md)\n",
+			 "set file %s is missing, continuing without calibration\n",
 			 filename);
 		return 0;
 	}
@@ -762,6 +743,9 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 			 "set file load failed (%d), continuing without calibration\n", ret);
 		if (READ_ONCE(dev_priv->wedged))
 			return ret;
+	} else {
+		/* dev_dbg: runtime PM reloads firmware on every open. */
+		dev_dbg(&dev_priv->pdev->dev, "loaded set file %s\n", filename);
 	}
 	return 0;
 }
@@ -871,12 +855,6 @@ int fthd_isp_cmd_channel_camera_config_select(struct fthd_private *dev_priv, int
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CAMERA_CONFIG_SELECT, &cmd, sizeof(cmd), &len);
 }
 
-/*
- * The firmware takes an origin and a size.  A window that leaves the sensor
- * array, or one whose width and x offset are both odd, is accepted and then
- * starves the channel until firmware reloads, so neither is ever sent.
- * fthd_v4l2_set_crop() already guarantees both; this is the last line.
- */
 int fthd_isp_cmd_channel_crop_set(struct fthd_private *dev_priv, int channel,
 				  int x, int y, int width, int height)
 {
@@ -889,11 +867,17 @@ int fthd_isp_cmd_channel_crop_set(struct fthd_private *dev_priv, int channel,
 
 	if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
 	    (sw && (unsigned int)x + width > sw) ||
-	    (sh && (unsigned int)y + height > sh) ||
-	    ((x & 1) && (width & 1))) {
+	    (sh && (unsigned int)y + height > sh)) {
 		dev_err(&dev_priv->pdev->dev,
-			"refusing crop %dx%d at %d,%d on a %ux%u sensor\n",
+			"crop %dx%d at %d,%d leaves the %ux%u sensor\n",
 			width, height, x, y, sw, sh);
+		return -ERANGE;
+	}
+
+	if ((x & 1) && (width & 1)) {
+		dev_err(&dev_priv->pdev->dev,
+			"crop width %d and x offset %d must not both be odd\n",
+			width, x);
 		return -ERANGE;
 	}
 
@@ -919,16 +903,10 @@ int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int ch
 	cmd.channel = channel;
 	cmd.x1 = x; /* Y size */
 	/*
-	 * x2 is the destination row stride in bytes, and it is now known to be
-	 * exactly that rather than the "chroma size?" upstream guessed at.
-	 * Upstream only ever had the packed formats, where two bytes per pixel
-	 * made the hardcoded x*2 both a correct stride and an unremarkable
-	 * constant, so nothing distinguished the two readings.
-	 *
-	 * The semi-planar format did: with x*2 sent for a one-byte-per-pixel
-	 * luma plane, the ISP writes luma rows at double spacing, leaving every
-	 * odd row zero.  No IOMMU fault is raised, because sizeimage still
-	 * covers what it writes.  For YUYV bytesperline is width*2 anyway.
+	 * x2 is the destination row stride in bytes.  For the packed formats
+	 * that is width * 2; for a one-byte-per-pixel luma plane it is width,
+	 * and sending width * 2 there makes the ISP write luma rows at double
+	 * spacing, leaving every odd row zero with no IOMMU fault.
 	 */
 	cmd.x2 = stride;
 	cmd.x3 = x;
@@ -1330,13 +1308,6 @@ int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv,
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_SET, &cmd, sizeof(cmd), &len);
 }
 
-int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv,
-				      int channel, int bias)
-{
-	return fthd_isp_cmd_channel_ae_bias_set_raw(dev_priv, channel,
-						     (u16)bias, 0);
-}
-
 int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel,
 				      u16 *bias, u32 *tag)
 {
@@ -1490,128 +1461,6 @@ int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(
 	return fthd_isp_cmd_channel_u32_set(dev_priv,
 			CISP_CMD_CH_AE_INTEGRATION_TIME_MAX_SET,
 			channel, value);
-}
-
-int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel,
-						 unsigned int usec)
-{
-	struct isp_cmd_channel_ae_integration_time_set cmd;
-	int len;
-
-	pr_debug("set integration time raw %u\n", usec);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.time = usec;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_INTEGRATION_TIME_SET, &cmd, sizeof(cmd), &len);
-}
-
-/* Not exposed: using two AE caps as a manual-gain control is unvalidated. */
-int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel,
-				     unsigned int gain)
-{
-	int ret;
-
-	pr_debug("set gain %u\n", gain);
-
-	ret = fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(dev_priv, channel,
-							    gain);
-	if (ret)
-		return ret;
-
-	return fthd_isp_cmd_channel_ae_gain_cap_set_raw(dev_priv, channel,
-							gain);
-}
-
-int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel,
-					unsigned int cct)
-{
-	struct isp_cmd_channel_awb_cct_manual cmd;
-	int len;
-
-	pr_debug("set awb cct raw %u\n", cct);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.cct = cct;
-	cmd.tag = 0;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_CCT_MANUAL, &cmd, sizeof(cmd), &len);
-}
-
-int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness)
-{
-	struct isp_cmd_channel_sharpness_set cmd;
-	int len;
-
-	pr_debug("set sharpness %d\n", sharpness);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.sharpness = sharpness;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SHARPNESS_SET, &cmd, sizeof(cmd), &len);
-}
-
-int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern)
-{
-	struct isp_cmd_channel_test_pattern_config cmd;
-	int len;
-
-	pr_debug("set test pattern %d\n", pattern);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.pattern = pattern;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEST_PATTERN_CONFIG, &cmd, sizeof(cmd), &len);
-}
-
-int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength)
-{
-	struct isp_cmd_channel_noise_reduction_set cmd;
-	int len;
-
-	pr_debug("set noise reduction %d\n", strength);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.strength = strength;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_NOISE_REDUCTION_SET, &cmd, sizeof(cmd), &len);
-}
-
-int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength)
-{
-	struct isp_cmd_channel_chroma_suppression_set cmd;
-	int len;
-
-	pr_debug("set chroma suppression %d\n", strength);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.field0 = strength;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CHROMA_SUPPRESSION_SET, &cmd, sizeof(cmd), &len);
-}
-
-/*
- * DRC strength.  fthd_start_channel() issues CISP_CMD_CH_DRC_START, which turns
- * the block on; this is the separate opcode that says how hard it works.
- */
-int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength)
-{
-	struct isp_cmd_channel_drc_set cmd;
-	int len;
-
-	pr_debug("set drc strength %d\n", strength);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.strength = strength;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_DRC_SET, &cmd, sizeof(cmd), &len);
 }
 
 /*
@@ -1835,10 +1684,6 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_streaming_mode(dev_priv, 0, 0);
 	if (ret)
 		return ret;
-	/* Brightness and contrast are not set here any more.  They used to be
-	 * pinned to 0x80 on every channel start, which silently discarded
-	 * whatever the user had set; fthd_start_streaming() now replays the
-	 * whole control handler instead, and its defaults are the same 0x80. */
 	ret = fthd_isp_cmd_channel_start(dev_priv);
 	if (ret)
 		return ret;
