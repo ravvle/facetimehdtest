@@ -241,12 +241,10 @@ replayed.
 - metering modes `0..3`;
 - crop on the array's edges, both axes and two crop widths: every rectangle
   streamed, ones past an edge were pulled back to it, and `crop_raw` echoed
-  the programmed `(x, y, width, height)`.
-
-**Not yet run on hardware since the last driver change:**
-- Eight queued buffers (`v4l2-ctl` queues four).
-- The 200 ms AE settle, as distinct from a later frame. Both were validated
-  upstream on other models.
+  the programmed `(x, y, width, height)`;
+- eight queued buffers at 29.97 fps;
+- the 200 ms AE settle: from a cold start the first frame is about 10% darker
+  than the settled level and is within a few percent by the fifth.
 
 **Open:**
 - Everything above on any machine other than this one MacBookAir7,2.
