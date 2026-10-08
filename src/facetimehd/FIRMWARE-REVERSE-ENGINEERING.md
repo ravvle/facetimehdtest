@@ -283,20 +283,12 @@ rectangles — straight out of the channel context:
 +0x1c..+0x28   ctx+0xb0, +0xb4, +0xb8, +0xbc
 ```
 
-`CISP_CMD_CH_CROP_SET` sends one four-word rectangle, so the GET returns two of
-them. Hardware identifies both, in the `(left, top, right, bottom)` form the
-setter uses: the first group (`0xd0..0xdc`) tracks the programmed crop exactly,
-and the second (`0xb0..0xbc`) never moved off `0 0 1280 720` across every
-rectangle tested — the full sensor array.
-
-They agree whenever the crop *is* the full array, which is what made them
-indistinguishable in the first readback run. It follows that crop GET carries
-no differential information about a rectangle being silently adjusted: the
-first group only echoes the geometry in effect, the second is a constant. It
-cannot root-cause the starving rectangle described in DOWNSTREAM.md; the
-firmware's own log at `dyndbg=+p` is the route to that. What it *is* good for
-is confirming from the ISP's side that a crop took effect, and reading the
-array bounds without inferring them.
+`CISP_CMD_CH_CROP_SET` sends one `(x, y, width, height)` rectangle, and the GET
+returns two in the same form. The first group (`0xd0..0xdc`) echoes the
+programmed crop; the second (`0xb0..0xbc`) is the full sensor array,
+`0 0 1280 720` here. The GET only echoes what is in effect, so it cannot reveal
+a silently adjusted rectangle. It confirms from the ISP side that a crop took
+effect, and reads the array bounds without inferring them.
 
 **`0x30d` AWB 2nd gain GET** (`0x4a9b4`) loads three destination pointers,
 `+0x0c`, `+0x10` and `+0x14`, and calls a vtable entry at `ctx.obj+0x70`. Three
@@ -351,7 +343,7 @@ things follow. The Q8.8 encoding, previously only "consistent with" the gain
 values, is corroborated on a quantity measured by an entirely different method.
 And minimum equal to maximum means the AE frame-rate window is clamped to the
 sensor's single rate, which is the readable reason behind the behavioural
-finding in DOWNSTREAM.md, "Frame-rate selection": this window is not a usable
+finding in DOWNSTREAM.md, "Frame rate": this window is not a usable
 rate control.
 
 **AWB second gain is not a live measurement.** All three words read exactly
@@ -573,12 +565,9 @@ is not evidence that a capture happened.**
   Accepted, persistent and teardown-safe here, but not measurably different.
 - Whether any sensor other than this one returns something other than the `-1`
   temperature sentinel, and its scale if so.
-- Why a past-centre crop rectangle starves the stream. Firmware stores the
-  rectangle exactly and the ISP honours a non-zero origin, so the fault is
-  downstream of crop programming; the driver clamps the origin, which makes it
-  unreachable through the ABI. A SIF or channel-start error at `dyndbg=+p` is
-  the obvious next evidence. See DOWNSTREAM.md, "Cropping and digital zoom",
-  which is authoritative on the measured rule.
+- Confirm on hardware that a crop flush with the far sensor edge streams and
+  that `crop_raw`'s first group equals the programmed `(x, y, width, height)`
+  (`hw-validate.sh --only crop-geometry`). See DOWNSTREAM.md, "Cropping".
 - Per-frame spacing under decimation. The mean rate is measured and correct at
   every divisor, but `hw-validate.sh` checks only a coarse bunching floor, so
   uneven spacing at the right average would still pass.

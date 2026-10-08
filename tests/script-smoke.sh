@@ -414,19 +414,27 @@ else
     result bad "a swept-table readback is writable or exposed through V4L2"
 fi
 
-# A crop origin past the array centre starves the stream and wedges the channel
-# on this firmware, so the driver clamps it. The ALIGN-then-cap order matters:
-# ALIGN rounds up, and rounding up past the centred maximum would recreate the
-# rectangle the clamp exists to prevent.
-if grep -q 'max_left = (max_w - r->width)  / 2;' "$v4l2_c" &&
-   grep -q 'max_top  = (max_h - r->height) / 2;' "$v4l2_c" &&
-   grep -q 'r->left = clamp_t(unsigned int, r->left, 0, max_left);' "$v4l2_c" &&
-   grep -q 'r->top  = clamp_t(unsigned int, r->top,  0, max_top);' "$v4l2_c" &&
-   grep -A 2 'r->left = ALIGN(r->left, 8);' "$v4l2_c" |
-        grep -q 'r->left = round_down(max_left, 8);'; then
-    result ok "crop origin is clamped to the array centre, and aligned before capping"
+# CISP_CMD_CH_CROP_SET takes (x, y, width, height); a window that leaves the
+# sensor starves the channel until firmware reloads. The driver clamps the origin
+# so the whole rectangle stays on the array, rounding *down* so the clamp cannot
+# be undone, and the command refuses anything off the array or odd/odd.
+if grep -q 'u32 width;' "$REPO_DIR/src/facetimehd/fthd_isp.h" &&
+   grep -q 'cmd.width = width;' "$isp_c" &&
+   grep -q 'crop->width, crop->height);' "$isp_c" &&
+   grep -q '((x & 1) && (width & 1))' "$isp_c" &&
+   grep -q 'r->left = round_down(min_t(unsigned int, r->left, max_w - r->width), 8);' "$v4l2_c" &&
+   grep -q 'r->top  = min_t(unsigned int, r->top, max_h - r->height);' "$v4l2_c"; then
+    result ok "crop is sent as origin plus size and clamped to stay on the array"
 else
-    result bad "the centred-origin crop clamp is missing or can round past its maximum"
+    result bad "the crop wire layout or its on-array clamp is missing"
+fi
+
+# YVYU (ISP code 2) writes invalid chroma, so it must not be reachable.
+if ! grep -q 'V4L2_PIX_FMT_YVYU' "$v4l2_c" &&
+   ! grep -q 'V4L2_PIX_FMT_YVYU' "$isp_c"; then
+    result ok "YVYU is neither enumerated nor mapped to an ISP code"
+else
+    result bad "YVYU is reachable; ISP code 2 writes invalid chroma"
 fi
 
 if grep -q 'strcmp(strim(buf), "same")' "$debugfs" &&

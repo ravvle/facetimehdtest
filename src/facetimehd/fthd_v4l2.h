@@ -20,10 +20,8 @@ struct fthd_fmt {
 	struct v4l2_pix_format fmt;
 	const char *desc;
 	int range; /* CISP_COMMAND_CH_OUTPUT_CONFIG_SET */
-	int x1; /* for CISP_CMD_CH_CROP_SET */
-	int y1;
-	int x2;
-	int y2;
+	struct v4l2_rect crop;	/* for CISP_CMD_CH_CROP_SET */
+	bool crop_set;		/* chosen by S_SELECTION, not derived */
 };
 
 struct fthd_private;

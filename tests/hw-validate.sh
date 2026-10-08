@@ -385,7 +385,7 @@ mean_luma() {
 
 # Full-frame, central spot, centre-quarter and outer-region means from the last
 # complete packed-YUV frame in a multi-frame capture. Y occupies every even
-# byte in both YUYV and YVYU. The smaller spot verifies that the operator's
+# byte in YUYV. The smaller spot verifies that the operator's
 # bright target is actually where the metering experiment expects it.
 frame_luma_metrics() {
     local file="$1" frame_size="$2" width="$3" height="$4"
@@ -495,9 +495,9 @@ timed_capture() {
 }
 
 # Sixteen block means (a 4x4 grid) of the last complete packed-YUV frame in a
-# capture. Y is every even byte in both YUYV and YVYU. Two such signatures
+# capture. Y is every even byte in YUYV. Two such signatures
 # taken of the same still scene through different crop rectangles are how this
-# script tells "the ISP moved the window" from "the ISP ignored x1/y1", which
+# script tells "the ISP moved the window" from "the ISP ignored the origin", which
 # a single full-frame mean cannot do.
 packed_block_luma() {
     local file="$1" frame_size="$2" width="$3" height="$4"
@@ -795,7 +795,7 @@ fi
 
 # ============================================================================
 # Section: timing
-# DOWNSTREAM.md - "DDR handling"
+# DOWNSTREAM.md - "DDR"
 #
 # 64K words is 64K non-posted PCIe reads. Total module load measured around
 # 640 ms on the MacBookAir7,2; this times the whole probe and prints a per-line
@@ -1045,7 +1045,7 @@ fi
 
 # ============================================================================
 # Section: runtimepm
-# DOWNSTREAM.md - "Power management and lifecycle"
+# DOWNSTREAM.md - "Power management"
 #
 # The failure mode to catch: camera works on first use after boot but not
 # after sitting idle. So the test is idle -> suspended -> open -> capture,
@@ -1130,7 +1130,7 @@ fi
 
 # ============================================================================
 # Section: suspend
-# DOWNSTREAM.md - "Suspending mid-stream"
+# DOWNSTREAM.md - "Power management"
 #
 # Expected: the machine sleeps instead of refusing to, and the viewer that was
 # streaming when the lid closed is still streaming when it opens - the driver
@@ -1796,7 +1796,7 @@ if wants metering-modes; then
         if [ -z "$metering_width" ] || [ -z "$metering_height" ] ||
            [ -z "$metering_frame_size" ]; then
             result FAIL metering.format "could not parse capture dimensions"
-        elif [ "$metering_fourcc" != YUYV ] && [ "$metering_fourcc" != YVYU ]; then
+        elif [ "$metering_fourcc" != YUYV ]; then
             result SKIP metering.format \
                 "luma parser does not support $metering_fourcc"
         else
@@ -2004,13 +2004,13 @@ fi
 
 # ============================================================================
 # Section: decimation
-# DOWNSTREAM.md - "Frame-rate selection"
+# DOWNSTREAM.md - "Frame rate"
 #
 # Nothing here guesses at a firmware payload: the divisor is applied to frames
 # the driver has already received, so this is driver logic and runs by default.
 # It answers the three open questions on that item - whether a decimated stream
 # really arrives at the requested rate, whether the requeue path keeps the ISP
-# fed from a pool of only four buffers, and whether a STREAMOFF in the middle
+# fed from a small buffer pool, and whether a STREAMOFF in the middle
 # of heavy decimation gives every one of them back.
 #
 # The rate is measured from the difference between a short and a long capture
@@ -2125,7 +2125,7 @@ if wants decimation; then
             # A coarse bunching probe, not a jitter measurement: N frames
             # cannot legitimately arrive faster than (N-1)/rate, so a short
             # capture finishing well inside that means the driver released a
-            # burst rather than spacing frames out. Only four buffers exist, so
+            # burst rather than spacing frames out. v4l2-ctl queues four buffers, so
             # a burst can never be large - this catches a broken divisor, not
             # small timing noise.
             floor_ms="$(awk -v n="$short_frames" -v e="$expect" \
@@ -2195,9 +2195,9 @@ fi
 
 # ============================================================================
 # Section: crop
-# DOWNSTREAM.md - "Cropping and digital zoom"
+# DOWNSTREAM.md - "Cropping"
 #
-# The open question is whether the ISP honours a non-zero x1/y1 at all, and a
+# The open question is whether the ISP honours a non-zero origin at all, and a
 # capture that merely succeeds does not answer it: a rectangle that is silently
 # ignored still produces perfectly good frames. So this compares the *shape* of
 # two frames taken through rectangles at opposite corners of the sensor array.
@@ -2249,14 +2249,10 @@ if wants crop; then
 
             # left top width height, and whether an exact readback is expected.
             #
-            # The two corner cases are regression cases, not exploratory ones.
-            # A crop origin past the array centre used to be accepted and then
-            # deliver no buffers at all, wedging the channel; the driver now
-            # clamps the origin to the centred maximum, so these rectangles
-            # come back adjusted and stream. They are marked 'rounded' for
-            # that reason - an exact readback would mean the clamp is gone.
-            # A starvation here now means the clamp failed, which is why the
-            # starved branch below is still a FAIL.
+            # The corner rectangles sit flush with the far edges of the array,
+            # so they stay on the sensor and must read back exactly and stream.
+            # A starvation is a FAIL: the firmware only starves on a window
+            # that leaves the array, and the driver never sends one.
             far_left=$(( sensor_w - out_w ))
             far_top=$(( sensor_h - out_h ))
             crop_sig_tl=""
@@ -2275,8 +2271,9 @@ if wants crop; then
                         "8 8 $out_w $out_h exact topleft" \
                         "$mid_left $mid_top $out_w $out_h exact midoffset" \
                         "4 5 $out_w $out_h rounded misaligned" \
-                        "$far_left $far_top $out_w $out_h rounded bottomright" \
-                        "$far_left 0 $out_w $out_h rounded cornerflush"; do
+                        "$far_left $far_top $out_w $out_h exact bottomright" \
+                        "$far_left 0 $out_w $out_h exact cornerflush" \
+                        "$(( far_left + 64 )) $(( far_top + 8 )) $out_w $out_h rounded pastedge"; do
                 read -r want_l want_t want_w want_h exactness label <<<"$spec"
 
                 dmesg_mark
@@ -2393,10 +2390,10 @@ if wants crop; then
                         "the scene has almost no spatial structure (spreads $spread_tl/$spread_br) - this cannot show whether the origin moved; re-run pointing at something uneven"
                 elif awk -v s="$shape" 'BEGIN{exit !(s >= 3)}'; then
                     result PASS crop.origin \
-                        "topleft versus $crop_far_label produced different images (shape difference $shape) - the ISP honours a non-zero x1/y1"
+                        "topleft versus $crop_far_label produced different images (shape difference $shape) - the ISP honours a non-zero origin"
                 else
                     result WARN crop.origin \
-                        "topleft versus $crop_far_label produced near-identical images (shape difference $shape) - either the scene was uniform or the ISP ignored x1/y1"
+                        "topleft versus $crop_far_label produced near-identical images (shape difference $shape) - either the scene was uniform or the ISP ignored the origin"
                 fi
                 result INFO crop.frames \
                     "kept /tmp/facetimehd-crop-{full,topleft,bottomright,misaligned}.raw for eyeballing"
@@ -2428,33 +2425,23 @@ fi
 
 # ============================================================================
 # Section: crop-geometry (opt-in)
-# FIRMWARE-REVERSE-ENGINEERING.md - "Complete dispatcher table sweep"
+# DOWNSTREAM.md - "Cropping"
 #
-# This section found the crop starvation rule and now guards the fix for it.
+# CISP_CMD_CH_CROP_SET takes (x, y, width, height). The firmware accepts a
+# window that leaves the sensor array and then delivers no frames until it is
+# reloaded, so the driver clamps the origin to keep the rectangle on the array.
 #
-# It reads CISP_CMD_CH_CROP_GET while a stream is live, which is how the
-# command's two rectangles were identified as the active crop and the sensor
-# array. Walking the origin then established that firmware starves whenever it
-# passes the centred position on either axis:
-#
-#     left <= (sensor_width  - crop_width)  / 2
-#     top  <= (sensor_height - crop_height) / 2
-#
-# measured across crop widths 1280/640/320 and heights 720/360/240, exact to
-# eight pixels horizontally and to one pixel vertically (top 180 streams, 181
-# starves). The driver clamps the origin to that maximum, so every rectangle
-# below should now come back adjusted and stream.
-#
-# The probes deliberately ask for origins past centre. Each one is therefore a
-# test that the clamp caught it: a rectangle that delivers no frames means the
-# clamp regressed, and is reported as a failure. The wedge-recovery machinery
-# is kept as a safety net for exactly that case.
+# Each probe sets a rectangle, reads CISP_CMD_CH_CROP_GET from a live stream
+# and checks that frames arrive. The first group of crop_raw must equal the
+# programmed (x, y, width, height). Rectangles flush with the far edges must
+# stream unchanged; ones past the edges must come back clamped to them and
+# stream. A starved rectangle is a FAIL, with wedge recovery as a safety net.
 #
 # It changes no firmware state: crop and format go through the ordinary
 # S_SELECTION/S_FMT paths, and every firmware command sent is a GET.
 # ============================================================================
 if wants crop-geometry; then
-    step "crop-geometry: reading the ISP's crop rectangles and finding the starvation bound"
+    step "crop-geometry: reading the ISP's crop rectangles at and past the array edges"
     log_section "SECTION crop-geometry"
 
     [ -n "$DEVICE" ] || wait_for_device || true
@@ -2513,7 +2500,7 @@ if wants crop-geometry; then
             # with the channel started, which is the case most worth sampling -
             # so frames are counted separately to say which happened.
             cg_probe() {
-                local l="$1" t="$2" w="$3" h="$4" label="$5"
+                local l="$1" t="$2" w="$3" h="$4" label="$5" expect="${6:-exact}"
                 local got g_l g_t g_w g_h want cap pid raw bytes flow
 
                 dmesg_mark
@@ -2528,7 +2515,14 @@ if wants crop-geometry; then
                 read -r g_l g_t g_w g_h <<CGEOF
 $got
 CGEOF
-                want="$g_l $g_t $((g_l + g_w)) $((g_t + g_h))"
+                want="$g_l $g_t $g_w $g_h"
+                if [ "$expect" = exact ] && [ "$want" != "$l $t $w $h" ]; then
+                    result FAIL "crop-geometry.$label.readback" \
+                        "asked for $l $t $w $h, driver stored $want"
+                elif [ "$expect" = clamped ] && [ "$want" = "$l $t $w $h" ]; then
+                    result FAIL "crop-geometry.$label.readback" \
+                        "$l $t $w $h leaves the array but was stored unclamped"
+                fi
 
                 cap="/tmp/facetimehd-cropgeom-$label.raw"
                 rm -f "$cap"
@@ -2547,24 +2541,20 @@ CGEOF
                 if [ "$bytes" -ge "$cg_frame_size" ]; then
                     flow="streaming"
                 else
-                    # Since the driver clamps the origin to the centred
-                    # maximum, no rectangle reachable through S_SELECTION
-                    # should starve any more. One that does means the clamp
-                    # regressed, so this is a failure rather than a datum.
                     flow="no frames delivered"
                     result FAIL "crop-geometry.$label.starved" \
-                        "$want delivered no frames; the centred-origin clamp should have prevented this"
+                        "$want delivered no frames; a rectangle on the array should stream"
                 fi
 
                 if [ -z "$raw" ]; then
                     result WARN "crop-geometry.$label" \
                         "requested $want, but the channel was not running to read crop_raw"
-                elif [ "$raw" = "$want/$want" ]; then
+                elif [ "${raw%%/*}" = "$want" ]; then
                     result PASS "crop-geometry.$label" \
-                        "both rectangles are $want, matching the request ($flow)"
+                        "firmware latched $want ($flow); array group ${raw#*/}"
                 else
-                    result INFO "crop-geometry.$label" \
-                        "requested $want, firmware returned $raw ($flow)"
+                    result FAIL "crop-geometry.$label" \
+                        "programmed $want, firmware returned $raw ($flow)"
                 fi
 
                 # Restore a rectangle known to stream before testing recovery,
@@ -2588,53 +2578,45 @@ CGEOF
                 fi
             }
 
-            # -- phase 1: 640-wide crop, origins at and past the centred maximum
+            # -- phase 1: 640-wide crop walked across the array to its edge
             cg_set_output "$CROP_WIDTH" "$CROP_HEIGHT"
             cg_centre=$(( (cg_sensor_w - cg_out_w) / 2 ))
             cg_far_left=$(( cg_sensor_w - cg_out_w ))
             result INFO crop-geometry.phase1 \
-                "${cg_out_w}x${cg_out_h} crop on ${cg_sensor_w}x${cg_sensor_h}; centred left is $cg_centre"
+                "${cg_out_w}x${cg_out_h} crop on ${cg_sensor_w}x${cg_sensor_h}; far edge at left $cg_far_left"
 
             cg_probe 0 0 "$cg_sensor_w" "$cg_sensor_h" full
-            cg_probe "$cg_centre" 0 "$cg_out_w" "$cg_out_h" "atcentre$cg_centre"
-            # Past centre: each of these is clamped back to the centred maximum.
-            for cg_step in 8 24 56 80; do
+            cg_probe "$cg_centre" 0 "$cg_out_w" "$cg_out_h" "centre$cg_centre"
+            for cg_step in 8 80; do
                 cg_probe $(( cg_centre + cg_step )) 0 "$cg_out_w" "$cg_out_h" \
-                         "past$(( cg_centre + cg_step ))"
+                         "right$(( cg_centre + cg_step ))"
             done
-            cg_probe "$cg_far_left" 0 "$cg_out_w" "$cg_out_h" cornerflush
+            cg_probe "$cg_far_left" 0 "$cg_out_w" "$cg_out_h" edge
+            cg_probe $(( cg_far_left + 64 )) 0 "$cg_out_w" "$cg_out_h" pastedge clamped
 
-            # -- phase 2: narrower crop, whose centred left (480 on a 1280 array)
-            # is further right than anything a 640-wide crop may use. This is
-            # what proved the limit tracks the crop width rather than being a
-            # fixed offset, and it checks the clamp scales with the width too.
+            # -- phase 2: narrower crop, so the edge sits further right
             cg_set_output $(( CROP_WIDTH / 2 )) $(( CROP_HEIGHT / 2 ))
             if [ "$cg_out_w" -ge "$CROP_WIDTH" ]; then
                 result SKIP crop-geometry.phase2 \
                     "the driver would not accept a narrower output; cannot vary crop width"
             else
-                cg_centre2=$(( (cg_sensor_w - cg_out_w) / 2 ))
+                cg_far_left2=$(( cg_sensor_w - cg_out_w ))
                 result INFO crop-geometry.phase2 \
-                    "${cg_out_w}x${cg_out_h} crop; centred left is $cg_centre2, past phase 1's streaming range"
-                cg_probe "$cg_centre" 0 "$cg_out_w" "$cg_out_h" "narrow_at$cg_centre"
-                cg_probe "$cg_centre2" 0 "$cg_out_w" "$cg_out_h" "narrow_centre$cg_centre2"
-                cg_probe $(( cg_centre2 + 80 )) 0 "$cg_out_w" "$cg_out_h" \
-                         "narrow_past$(( cg_centre2 + 80 ))"
+                    "${cg_out_w}x${cg_out_h} crop; far edge at left $cg_far_left2"
+                cg_probe "$cg_far_left2" 0 "$cg_out_w" "$cg_out_h" narrow_edge
+                cg_probe $(( cg_far_left2 + 80 )) 0 "$cg_out_w" "$cg_out_h" \
+                         narrow_pastedge clamped
             fi
 
-            # -- phase 3: the vertical axis, which is symmetric. Left is held at
-            # 0 so anything seen here is the vertical limit and not a
-            # horizontal violation leaking in. The driver rounds left to eight
-            # pixels but not top, which is why a one-pixel step past centre is
-            # expressible on this axis - and it starved, before the clamp.
+            # -- phase 3: the vertical axis, which is not rounded, so a
+            # one-pixel step past the edge is expressible.
             cg_set_output "$CROP_WIDTH" "$CROP_HEIGHT"
-            cg_centre_y=$(( (cg_sensor_h - cg_out_h) / 2 ))
+            cg_far_top=$(( cg_sensor_h - cg_out_h ))
             result INFO crop-geometry.phase3 \
-                "vertical axis at left 0: ${cg_out_w}x${cg_out_h} crop, centred top is $cg_centre_y"
-            cg_probe 0 "$cg_centre_y" "$cg_out_w" "$cg_out_h" "vcentre$cg_centre_y"
-            cg_probe 0 $(( cg_centre_y + 1 )) "$cg_out_w" "$cg_out_h" \
-                     "vpast$(( cg_centre_y + 1 ))"
-            cg_probe 0 $(( cg_sensor_h - cg_out_h )) "$cg_out_w" "$cg_out_h" vfar
+                "vertical axis at left 0: ${cg_out_w}x${cg_out_h} crop, far edge at top $cg_far_top"
+            cg_probe 0 $(( cg_far_top / 2 + 1 )) "$cg_out_w" "$cg_out_h" "vmid$(( cg_far_top / 2 + 1 ))"
+            cg_probe 0 "$cg_far_top" "$cg_out_w" "$cg_out_h" vedge
+            cg_probe 0 $(( cg_far_top + 1 )) "$cg_out_w" "$cg_out_h" vpastedge clamped
 
             if [ -n "$cg_default" ]; then
                 IFS=, read -r cd_l cd_t cd_w cd_h <<<"$cg_default"
@@ -2860,7 +2842,7 @@ fi
 
 # ============================================================================
 # Section: reboot (opt-in, two-phase)
-# DOWNSTREAM.md - "Hardware validation status", reboot/kexec while streaming
+# DOWNSTREAM.md - "Validation", reboot/kexec while streaming
 #
 # fthd_pci_shutdown() runs at reboot instead of fthd_pci_remove(). It cannot
 # be tested without actually rebooting, so this arms a marker, starts a

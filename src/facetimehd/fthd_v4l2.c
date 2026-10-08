@@ -62,50 +62,17 @@
 #define FTHD_AWB_CCT_MAX 65535
 
 /*
- * The ISP's semi-planar output, format code 0, is NV12 - and hardware said so.
+ * The ISP's semi-planar output, format code 0, is NV12.  Measured on a
+ * MacBookAir7,2: a width*height luma plane followed by exactly width*height/2
+ * of chroma, with Cb/Cr means within 0.2 of a YUYV capture of the same scene.
+ * NV16 is not offered because no code produces it.
  *
- * Upstream's 2015 comment called code 0 "plane 0 Y plane 1 UV" without giving
- * it a sampling, and every later reading of this driver - including this fork's
- * own notes - assumed 4:2:2 and called it NV16.  A capture on a MacBookAir7,2
- * settled it: the ISP wrote a width*height luma plane followed by exactly
- * width*height/2 of chroma - 360 chroma rows for a 720-row frame - and left the
- * remaining 460,800 bytes of the NV16-sized buffer untouched.  Splitting that
- * chroma into its components gave Cb 122.3 and Cr 135.3 against 122.5 and 135.4
- * from a YUYV capture of the same scene seconds later.  That is 4:2:0.
- *
- * So NV12 is not a guess here, and the old warning against it - that nothing
- * identified a 4:2:0 code and sizing a buffer for 1.5 bytes per pixel while the
- * ISP wrote 2 would overrun the mapping - had the risk backwards.  The ISP
- * writes 4:2:0; sizing for 4:2:2 over-allocated and left a tail unwritten.
- * NV16 is the format with no evidence behind it and is not offered.
- *
- * It was gated behind a module parameter until the driver had streamed with
- * sizeimage cut to the 4:2:0 size, since the measurements above came from an
- * over-sized buffer.  That run passed - correct sizeimage, no blank luma rows,
- * chroma at 127.2 against a YUYV reference midpoint of 126.8, and no firmware,
- * buffer or DMA fault - so the format is advertised normally.
- *
- * It is now enumerated first and is the format a freshly opened device
- * reports.  The measured part of that argument is the size: 1.5 bytes per
- * pixel against 2, so a frame is three quarters of the packed one and costs
- * that much less DMA and that much less to copy.  The rest is about who reads
- * index 0.  Anything that negotiates - GStreamer, ffmpeg, a browser - walks
- * the whole list and names what it wants, so the order does not reach it;
- * index 0 is what simple code takes, and simple code here overwhelmingly feeds
- * a display or a 4:2:0 encoder, which would have downsampled the chroma
- * itself.
- *
- * What is *not* established is that code 0 is the pipeline's native sampling
- * rather than a downsample of a genuinely 4:2:2 chroma stream.  The evidence
- * for 4:2:0 is plane extents and chroma *means* matching a YUYV reference, and
- * a mean cannot see vertical chroma resolution.  If it turns out to be a
- * downsample, that costs detail only for an application taking index 0 and
- * displaying it; nothing above depends on which way it goes, but do not write
- * the stronger claim into this comment without the measurement behind it.
- *
- * Nothing is withdrawn - YUYV and YVYU are still enumerated and still accepted
- * - so an application that names one gets exactly what it always got.  Only
- * one that takes whatever comes first sees the change.
+ * NV12 is enumerated first and is the default: a frame is three quarters of a
+ * packed one, and the simple code that takes index 0 mostly feeds a display or
+ * a 4:2:0 encoder.  Negotiating applications name their format, so the order
+ * does not reach them.  Whether code 0 is native 4:2:0 or a downsample of 4:2:2
+ * chroma is not established - chroma means cannot tell - and nothing here
+ * depends on it.
  */
 
 /* The only rate the sensor delivers.  Everything the driver reports is derived
@@ -116,20 +83,15 @@
 /*
  * Slower capture rates are produced by delivering one sensor frame in N and
  * handing the rest straight back to the ISP, so the rate the application asks
- * for is the rate it gets, exactly.
+ * for is the rate it gets, exactly: the divisor is applied to frames the driver
+ * has already received, so G_PARM cannot disagree with the stream.
  *
- * The firmware route was considered and deliberately not taken.  There is an AE
- * frame-rate window (CISP_CMD_CH_AE_FRAME_RATE_{MIN,MAX}_SET), which
- * fthd_start_channel() already programs, but it is the exposure loop's rate
- * window rather than a sensor mode, its units are undocumented, and the sensor
- * demonstrably keeps delivering 30 fps with it set to the value used there.  A
- * rate that the driver reports but the hardware does not deliver is the exact
- * failure that made GStreamer's pipewiresrc compute negative frame durations
- * and stall - see the G_PARM comment below.  Dropping frames cannot desync that
- * way: the divisor is applied to frames the driver has already received.
+ * The ISP's AE frame-rate window (CISP_CMD_CH_AE_FRAME_RATE_{MIN,MAX}_SET) is
+ * held at 30 fps by fthd_start_channel().  Whether lowering it lowers the
+ * delivered rate has not been measured here, so S_PARM does not use it.
  *
- * The cost is honest and bounded: the ISP still runs at full rate, so this
- * saves bus and CPU work in the application, not power in the camera.
+ * The ISP still runs at full rate, so this saves bus and CPU work in the
+ * application, not power in the camera.
  */
 #define FTHD_MAX_FPS_DIVISOR FTHD_FPS
 
@@ -155,6 +117,7 @@ static int fthd_buffer_queue_setup(
 
 	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
 	struct v4l2_pix_format *cur_fmt = &dev_priv->fmt.fmt;
+	unsigned int limit;
 
 	/* This is a single-planar VIDEO_CAPTURE queue. */
 	if (*nplanes) {
@@ -169,14 +132,12 @@ static int fthd_buffer_queue_setup(
 	sizes[0] = cur_fmt->sizeimage;
 	alloc_devs[0] = &dev_priv->pdev->dev;
 
-	/* The ceiling is the h2t_bufs array, not a memory budget: every queued
-	 * buffer needs one of its FTHD_BUFFERS hardware slots. The literal 4
-	 * here used to duplicate that constant. */
-	*nbuffers = (4096 * 4096) / sizes[0];
-	if (*nbuffers > FTHD_BUFFERS)
-		*nbuffers = FTHD_BUFFERS;
-	if (*nbuffers <= 1)
+	/* Honour the requested count, at least two, within both the h2t_bufs
+	 * slots and a 16 MiB budget (eight 720p YUYV frames fit). */
+	limit = min_t(unsigned int, FTHD_BUFFERS, (4096 * 4096) / sizes[0]);
+	if (limit < 2)
 		return -ENOMEM;
+	*nbuffers = clamp_t(unsigned int, *nbuffers, 2, limit);
 	pr_debug("using %d buffers\n", *nbuffers);
 
 	return 0;
@@ -848,7 +809,7 @@ void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park)
  *
  * The ISP has just been reloaded from scratch, so every buffer vb2 still
  * considers the driver's needs its descriptor and its S2 mapping built again.
- * fthd_buffer_prepare() is exactly that work and all four slots are free by
+ * fthd_buffer_prepare() is exactly that work and all the slots are free by
  * now, so each one lands where a fresh QBUF would put it; the channel then
  * comes back up and takes them, replaying the control values on the way.
  *
@@ -1050,11 +1011,12 @@ static int fthd_v4l2_ioctl_querycap(struct file *filp, void *priv,
 /*
  * The ISP's output-format codes are NV12 0, YUYV 1, YVYU 2.  NV16 is absent
  * because no code produces it: code 0 was measured writing 4:2:0 on hardware.
+ * YVYU is absent because code 2 writes invalid chroma (both U and V near 49,
+ * rendering green and pink) rather than YUYV with the chroma swapped.
  */
 static bool fthd_format_supported(u32 pixelformat)
 {
 	return pixelformat == V4L2_PIX_FMT_YUYV ||
-	       pixelformat == V4L2_PIX_FMT_YVYU ||
 	       pixelformat == V4L2_PIX_FMT_NV12;
 }
 
@@ -1071,10 +1033,6 @@ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
 	case 1:
 		fmt->pixelformat = V4L2_PIX_FMT_YUYV;
 		desc = "YUYV";
-		break;
-	case 2:
-		fmt->pixelformat = V4L2_PIX_FMT_YVYU;
-		desc = "YVYU";
 		break;
 	default:
 		return -EINVAL;
@@ -1183,10 +1141,10 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
 
 	dev_priv->fmt.fmt = fmt->fmt.pix;
 
-	/* The crop may no longer be large enough for the new output size, and
-	 * the ISP must never be asked to upscale.  Growing it here is the
-	 * adjustment V4L2 allows a driver to make; the alternative, refusing the
-	 * format, would make S_FMT depend on the order the two were set in. */
+	/* Re-derive the default crop for the new aspect ratio, or grow a chosen
+	 * one that is now smaller than the output: the ISP must never be asked
+	 * to upscale, and refusing the format instead would make S_FMT depend on
+	 * the order the two were set in. */
 	fthd_v4l2_refresh_crop(dev_priv);
 
 	return 0;
@@ -1328,15 +1286,13 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
  * format (see fthd_start_channel()).  Making that rectangle settable is digital
  * zoom and pan: the same output size taken from a smaller part of the array.
  *
- * Two rules keep it from asking the hardware for something it may not do.  The
- * crop is never smaller than the current output size, so the scaler is only
- * ever asked to shrink - upscaling is a separate capability that nothing here
- * can confirm the ISP has.  And the crop is only settable while the channel is
- * down, because the rectangle is programmed once during the channel-start
- * sequence and there is no evidence the firmware accepts a new one mid-stream.
+ * The crop is never smaller than the current output size, so the scaler is only
+ * ever asked to shrink - nothing here can confirm the ISP upscales.  And it is
+ * only settable while the channel is down, because the rectangle is programmed
+ * once during the channel-start sequence.
  */
-static void fthd_v4l2_default_crop(struct fthd_private *dev_priv,
-				   struct v4l2_rect *r)
+static void fthd_v4l2_crop_bounds(struct fthd_private *dev_priv,
+				  struct v4l2_rect *r)
 {
 	r->left = 0;
 	r->top = 0;
@@ -1344,21 +1300,46 @@ static void fthd_v4l2_default_crop(struct fthd_private *dev_priv,
 	r->height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 }
 
+/*
+ * The largest centred window with the output's aspect ratio, so a 4:3 format
+ * on the 16:9 array is cropped at the sides rather than squashed.  Rounding the
+ * width down to eight keeps it at least the (eight-aligned) output width.
+ */
+static void fthd_v4l2_default_crop(struct fthd_private *dev_priv,
+				   struct v4l2_rect *r)
+{
+	unsigned int ow = dev_priv->fmt.fmt.width;
+	unsigned int oh = dev_priv->fmt.fmt.height;
+	unsigned int sw, sh;
+
+	fthd_v4l2_crop_bounds(dev_priv, r);
+	sw = r->width;
+	sh = r->height;
+
+	if (ow && oh) {
+		if ((u64)ow * sh >= (u64)sw * oh)
+			r->height = sw * oh / ow;
+		else
+			r->width = sh * ow / oh;
+	}
+	r->width = round_down(r->width, 8);
+	r->left = (sw - r->width) / 2;
+	r->top  = (sh - r->height) / 2;
+}
+
 static void fthd_v4l2_get_crop(struct fthd_private *dev_priv,
 			       struct v4l2_rect *r)
 {
-	r->left   = dev_priv->fmt.x1;
-	r->top    = dev_priv->fmt.y1;
-	r->width  = dev_priv->fmt.x2 - dev_priv->fmt.x1;
-	r->height = dev_priv->fmt.y2 - dev_priv->fmt.y1;
+	*r = dev_priv->fmt.crop;
 }
 
 /*
- * Fit @r inside the sensor array, keeping it at least as large as the output
- * format and its origin at or before the array centre, and store it.  Shared by S_SELECTION and by the sensor-geometry
- * fixups, so a crop can never survive into a state the ISP would reject: the
- * sensor's real size is only learned at channel start, and on the 12-inch
- * MacBook (848x588) it is smaller than the fallback this starts out with.
+ * Fit @r inside the sensor array, at least as large as the output format, and
+ * store it.  The firmware accepts a window that leaves the array and then
+ * delivers no frames until it is reloaded, so the origin is clamped to keep the
+ * whole rectangle on the sensor.  The width is a multiple of eight, which also
+ * rules out the odd-width-at-odd-offset window that faults the sensor
+ * interface.
  */
 static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 			       struct v4l2_rect *r)
@@ -1367,7 +1348,6 @@ static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 	unsigned int min_w = max(FTHD_MIN_WIDTH, dev_priv->fmt.fmt.width);
 	unsigned int min_h = max(FTHD_MIN_HEIGHT, dev_priv->fmt.fmt.height);
-	unsigned int max_left, max_top;
 
 	/* The output can never exceed the array, so neither can the floor. */
 	min_w = min(min_w, max_w);
@@ -1376,73 +1356,35 @@ static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 	r->width  = clamp_t(unsigned int, r->width,  min_w, max_w);
 	r->height = clamp_t(unsigned int, r->height, min_h, max_h);
 
-	/* Same eight-pixel width alignment the output format uses; the sensor
-	 * interface is fed in the same units either way. */
 	r->width = ALIGN(r->width, 8);
 	if (r->width > max_w)
 		r->width = round_down(max_w, 8);
 
-	/* left and top are signed in struct v4l2_rect and userspace may pass a
-	 * negative one.  Clamped before the unsigned clamps below, which would
-	 * otherwise turn -1 into a very large offset and push the rectangle to
-	 * the far edge instead of to the origin. */
+	/* left and top are signed in struct v4l2_rect. */
 	if (r->left < 0)
 		r->left = 0;
 	if (r->top < 0)
 		r->top = 0;
 
-	/*
-	 * The origin may not pass the centred position on either axis.  A
-	 * rectangle beyond it would be accepted by firmware and stored exactly
-	 * - the crop_raw readback confirms that - and would then deliver no
-	 * buffers at all, wedging the channel until the firmware is reloaded.
-	 * Clamping here is what keeps one from being programmed, so a clamped
-	 * rectangle streams normally.  Measured on a MacBookAir7,2 across crop
-	 * widths 1280/640/320 and heights 720/360/240: streaming at or left of
-	 * centre and starved past it, exact to eight pixels horizontally and to
-	 * a single pixel vertically (top 180 streams, 181 starves).
-	 * Equivalently left + right must not exceed the array width, nor
-	 * top + bottom its height.
-	 *
-	 * Clamping rather than refusing, because S_SELECTION is an adjusting
-	 * call and this driver already rounds the rectangle: G_SELECTION
-	 * reports what was programmed, so an application can see what it got.
-	 * See DOWNSTREAM.md, "Cropping and digital zoom".
-	 */
-	max_left = (max_w - r->width)  / 2;
-	max_top  = (max_h - r->height) / 2;
+	r->left = round_down(min_t(unsigned int, r->left, max_w - r->width), 8);
+	r->top  = min_t(unsigned int, r->top, max_h - r->height);
 
-	r->left = clamp_t(unsigned int, r->left, 0, max_left);
-	r->top  = clamp_t(unsigned int, r->top,  0, max_top);
-	/*
-	 * ALIGN rounds up, so it has to be capped again afterwards: the centred
-	 * maximum is not necessarily a multiple of eight, and rounding up past
-	 * it would produce exactly the rectangle this is here to prevent.
-	 */
-	r->left = ALIGN(r->left, 8);
-	if (r->left > max_left)
-		r->left = round_down(max_left, 8);
-
-	dev_priv->fmt.x1 = r->left;
-	dev_priv->fmt.y1 = r->top;
-	dev_priv->fmt.x2 = r->left + r->width;
-	dev_priv->fmt.y2 = r->top + r->height;
+	dev_priv->fmt.crop = *r;
 }
 
 /*
- * Re-fit the stored crop after something it depends on changed - a new output
- * format, or the sensor geometry becoming known for the first time.  Called
- * from fthd_start_channel() before the rectangle is handed to the firmware.
+ * Re-fit the crop after something it depends on changed - a new output format,
+ * or the sensor geometry becoming known.  Until S_SELECTION sets one, the crop
+ * follows the format's aspect ratio.
  */
 void fthd_v4l2_refresh_crop(struct fthd_private *dev_priv)
 {
 	struct v4l2_rect r;
 
-	if (dev_priv->fmt.x2 <= dev_priv->fmt.x1 ||
-	    dev_priv->fmt.y2 <= dev_priv->fmt.y1)
-		fthd_v4l2_default_crop(dev_priv, &r);
-	else
+	if (dev_priv->fmt.crop_set)
 		fthd_v4l2_get_crop(dev_priv, &r);
+	else
+		fthd_v4l2_default_crop(dev_priv, &r);
 
 	fthd_v4l2_set_crop(dev_priv, &r);
 }
@@ -1460,8 +1402,10 @@ static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
 		fthd_v4l2_get_crop(dev_priv, &sel->r);
 		return 0;
 	case V4L2_SEL_TGT_CROP_DEFAULT:
-	case V4L2_SEL_TGT_CROP_BOUNDS:
 		fthd_v4l2_default_crop(dev_priv, &sel->r);
+		return 0;
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		fthd_v4l2_crop_bounds(dev_priv, &sel->r);
 		return 0;
 	default:
 		return -EINVAL;
@@ -1472,6 +1416,7 @@ static int fthd_v4l2_ioctl_s_selection(struct file *filp, void *priv,
 		struct v4l2_selection *sel)
 {
 	struct fthd_private *dev_priv = video_drvdata(filp);
+	struct v4l2_rect def;
 
 	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
@@ -1492,7 +1437,11 @@ static int fthd_v4l2_ioctl_s_selection(struct file *filp, void *priv,
 	if (sel->flags & (V4L2_SEL_FLAG_GE | V4L2_SEL_FLAG_LE))
 		return -ERANGE;
 
+	/* Setting the CROP_DEFAULT rectangle hands the crop back to the format,
+	 * so it follows the aspect ratio of later S_FMT calls again. */
 	fthd_v4l2_set_crop(dev_priv, &sel->r);
+	fthd_v4l2_default_crop(dev_priv, &def);
+	dev_priv->fmt.crop_set = memcmp(&sel->r, &def, sizeof(def)) != 0;
 	return 0;
 }
 
@@ -1521,16 +1470,10 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
 
         .vidioc_reqbufs         = vb2_ioctl_reqbufs,
 	/*
-	 * No .vidioc_create_bufs.  CREATE_BUFS asks for buffers *in addition*
-	 * to those already allocated, and dev_priv->h2t_bufs is a fixed array
-	 * of FTHD_BUFFERS slots, so the pool cannot grow past four however it
-	 * is asked.  fthd_buffer_queue_setup() overwrote the caller's count
-	 * with its own instead of failing, which meant CREATE_BUFS silently
-	 * returned a different number of buffers than it was asked for -
-	 * five v4l2-compliance failures, all this one cause.
-	 *
-	 * REQBUFS is the supported way to size the queue here.  An optional
-	 * ioctl reported as unsupported is correct; one that lies is not.
+	 * No .vidioc_create_bufs.  It asks for buffers *in addition* to those
+	 * already allocated, which fthd_buffer_queue_setup() does not account
+	 * against the slot and memory limits.  REQBUFS is the supported way to
+	 * size the queue; an optional ioctl reported as unsupported is correct.
 	 */
 	.vidioc_querybuf        = vb2_ioctl_querybuf,
 	.vidioc_qbuf            = vb2_ioctl_qbuf,

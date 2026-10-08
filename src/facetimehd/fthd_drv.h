@@ -29,7 +29,7 @@
 #define FTHD_PCI_S2_MEM 2
 #define FTHD_PCI_ISP_IO 4
 
-#define FTHD_BUFFERS 4
+#define FTHD_BUFFERS 8
 
 enum FW_CHAN_TYPE {
 	FW_CHAN_TYPE_OUT=0,
@@ -139,7 +139,6 @@ struct fthd_private {
 	 * The ISP only accepts the image-quality commands while the channel is
 	 * running, so s_ctrl consults this rather than failing when it isn't. */
 	bool channel_running;
-	int frametime;
 	/* Frame-rate division.  The sensor delivers a fixed rate and the driver
 	 * passes on one frame in @fps_divisor of it, handing the rest straight
 	 * back to the ISP from @requeue_work; @frame_phase counts within the

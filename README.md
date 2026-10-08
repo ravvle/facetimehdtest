@@ -9,54 +9,36 @@ distributions.
 [![Distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Fedora%20%7C%20AlmaLinux-orange)](#distribution-compatibility)
 [![Kernel](https://img.shields.io/badge/kernel-5.15%2B-blue)](https://kernel.org)
 
-## Differences from the original driver
+## Differences from upstream
 
 The driver here is a maintained fork of
-[patjak/facetimehd](https://github.com/patjak/facetimehd). It differs as
-follows.
+[patjak/facetimehd](https://github.com/patjak/facetimehd). Compared with
+upstream `master` today, it adds:
 
-- **Streams survive system suspend.** Upstream errored the vb2 queue on
-  suspend, so an application woke to `-EIO` and could only recover by
-  restarting the stream; most reported a camera failure instead. The stream is
-  now parked and resumed into the same buffers.
-- **Current kernels are supported.** CI builds the driver weekly against kernel
-  5.15 through 7.1 across the supported distributions, and DKMS rebuilds it
-  after a kernel update. Kernels older than 5.15 are not supported.
-- **Lower resolutions use the full sensor.** A 640x480 request is the whole
-  scene scaled down; upstream cropped that rectangle out of the top-left
-  corner, giving a zoomed and off-centre picture.
-- **Requested frame rates are delivered.** Upstream accepted any rate and
-  delivered 30 fps regardless, which made GStreamer's `pipewiresrc` compute
-  negative frame durations and stall after one frame. Rates are now produced by
-  frame decimation.
-- **Sensor calibration is installed.** The installer extracts Apple's
-  calibration data alongside the firmware, and selects the correct file on
-  MacBook Air models, which upstream did not. Four of the nine sensors the
-  driver recognises are covered — see
-  [Firmware and sensor calibration](#firmware-and-sensor-calibration).
-- **MacBook8,1 is usable.** Sensor dimensions are detected at runtime rather
-  than assumed, so the 848x588 array in the 12-inch MacBook no longer drives
-  the sensor interface into errors.
-- **Digital zoom and pan** through `VIDIOC_S_SELECTION`. Upstream pinned the
-  crop to the full sensor array.
-- **NV12 is the default format**, alongside YUYV and YVYU. A frame is three
-  quarters the size of a packed one; the packed formats are still enumerated
-  and still accepted, so anything that asks for one by name is unaffected.
-- **Anti-banding and exposure controls are exposed.** 50/60 Hz anti-banding and
-  automatic/manual exposure; upstream exposed neither. Firmware accepts every
-  value and capture continues after a change, but the visible effect is still a
-  hardware-validation target.
-- **Firmware and streaming failures surface as errors** rather than leaving a
-  capture blocked indefinitely, and the camera runtime-suspends when nothing is
-  using it.
+- **Streams that survive system suspend.** Upstream refuses to suspend while
+  any application has the camera open. Here the stream is parked and resumes
+  into the same buffers.
+- **Runtime power management.** The camera powers down when nothing is using
+  it.
+- **Frame rates delivered exactly**, by frame decimation, and changeable
+  mid-stream.
+- **Digital zoom and pan** through `VIDIOC_S_SELECTION`.
+- **NV12** as the default format, alongside YUYV. Each frame is a quarter
+  smaller.
+- **Anti-banding (50/60 Hz) and an automatic/manual exposure switch.** The
+  firmware accepts every value; the visible effect is still being validated.
+- **A colour-temperature readout** (`awb_cct_estimate`, read-only).
+- **Hardening:**
+  - bounds-checked register access;
+  - validation of everything the firmware returns;
+  - bounded IRQ and ring processing;
+  - wedge handling for firmware timeouts;
+  - PCI error recovery;
+  - failures reported to applications instead of blocking them.
 
-Beyond those: bounds-checked register access, validation of the data firmware
-returns, symmetric probe/suspend/resume teardown, bounded IRQ and ring
-processing, and the removal of guessed firmware commands that could hard-lock
-the machine. Core probing, capture, runtime suspend/resume and system suspend
-recovery are tested on a MacBookAir7,2. The complete change list and the
-current hardware-validation limits are in
-[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
+The full list, and what has and has not been validated on hardware, is in
+[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md). CI builds the driver weekly
+for kernels 5.15 through 7.1; older kernels are not supported.
 
 ## What the installer does
 
@@ -244,7 +226,7 @@ produces incorrect colours, so `install.sh` fetches them on every run where
 - **`unar` is missing**, which on Enterprise Linux means EPEL has not rebuilt
   it for that release. The installer warns and continues.
 - **Your sensor is not one of the four the download carries.** The driver
-  recognises nine; a machine needing one of the other five logs
+  recognises eleven; a machine needing one of the other seven logs
   `no sensor calibration file ...` in `dmesg`, and `install.sh --status`
   reports the same.
 
@@ -315,14 +297,11 @@ freshly opened device reports. A frame is three quarters the size of the packed
 equivalent, and the code that takes whatever format is offered first is usually
 feeding a display or a video encoder that wants 4:2:0 anyway.
 
-`YUYV` and `YVYU` are also offered, both 4:2:2 packed. Either is available at
-the sensor's native size or any smaller 8-pixel-aligned width, and nothing was
-withdrawn to make room for NV12 — an application that asks for one by name gets
-exactly what it always got. Only one that takes whatever is offered first sees
-the change.
+`YUYV` (4:2:2 packed) is also offered. Both formats work at the sensor's
+native size or any smaller width that is a multiple of 8.
 
-`NV16` is not offered: the camera's semi-planar output was measured writing
-4:2:0, so nothing it produces is 4:2:2 semi-planar.
+`YVYU` is not offered, because the camera writes invalid colour data in that
+mode. `NV16` is not offered either: no mode of the camera produces it.
 
 ### Raw firmware readbacks
 
@@ -474,34 +453,18 @@ Common answers:
 | Camera unreliable when idle | Driver runtime PM explicitly enabled | `sudo ./scripts/install.sh --runtime-pm off` |
 | Live reload freezes the machine | Kernel-driver regression | Reinstall with `--no-load --runtime-pm off`, then reboot deliberately |
 | Install fails at the Apple download | Apple's URL moved | `./scripts/extract-firmware.sh --check-sources` and open an issue |
-| Cropped picture is not where you asked for it | Crop origin clamped to the array centre | Expected; read the rectangle back with `G_SELECTION` (see below) |
+| Cropped picture is not where you asked for it | Crop moved back onto the sensor | Expected; read the rectangle back with `G_SELECTION` (see below) |
 
-### The crop origin is limited to the array centre
+### The crop is kept on the sensor
 
-If you set a crop rectangle, the driver may move its origin left or up. That is
-deliberate, and it is what keeps the camera working: on this firmware a crop
-whose origin sat past the middle of the sensor *would be* accepted and then
-deliver no frames at all, leaving the camera unusable — for every application,
-not just yours — until the driver reloaded. The driver never programs such a
-rectangle, because the origin is clamped to:
+If you set a crop rectangle that runs off the edge of the sensor, the driver
+moves it back on. It also rounds `left` down to a multiple of 8 pixels. The
+camera's firmware would accept a rectangle off the edge and then stop
+delivering frames to every application until the driver reloaded.
+`VIDIOC_G_SELECTION` reports the rectangle actually in use.
 
-```text
-left <= (sensor_width  - crop_width)  / 2
-top  <= (sensor_height - crop_height) / 2
-```
-
-Equivalently, the crop's centre may not pass the sensor's centre. Landing
-exactly on the limit is fine — a centred rectangle is the furthest right and
-furthest down you can go, and a smaller crop can start further along than a
-larger one. `left` is also rounded to a multiple of eight pixels.
-
-A clamped crop streams normally. The only thing you lose is the framing you
-asked for, so the camera does not stop working because the driver moved your
-rectangle — moving it is what stops that from happening.
-
-`VIDIOC_G_SELECTION` always reports the rectangle that was actually programmed,
-so read it back if the framing matters. Most applications never set a crop and
-are unaffected.
+Until an application sets one, the crop is the largest centred window with
+the output's aspect ratio. A 4:3 format is cropped at the sides, not squashed.
 
 ### Opening an issue
 

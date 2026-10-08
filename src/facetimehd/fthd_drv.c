@@ -648,12 +648,6 @@ static int fthd_pci_probe(struct pci_dev *pdev,
 
 	dev_priv->ddr_model = 4;
 	dev_priv->ddr_speed = 450;
-	/* AE frame-rate window handed to CISP_CMD_CH_AE_FRAME_RATE_{MIN,MAX}_SET
-	 * as frametime * 256.  This is not the rate the driver reports: the
-	 * sensor delivers FTHD_FPS regardless, and G_PARM/S_PARM/
-	 * ENUM_FRAMEINTERVALS report that.  Left at the value the ISP has always
-	 * been programmed with, since nothing here can retune AE blind. */
-	dev_priv->frametime = 40;
 
 	spin_lock_init(&dev_priv->io_lock);
 	spin_lock_init(&dev_priv->buffer_lock);
@@ -925,6 +919,8 @@ MODULE_FIRMWARE("facetimehd/firmware.bin");
  * them, and a missing one is logged but non-fatal. */
 MODULE_FIRMWARE("facetimehd/8221_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1222_01XX.dat");
+MODULE_FIRMWARE("facetimehd/1571_01XX.dat");
+MODULE_FIRMWARE("facetimehd/1575_01XX.dat");
 MODULE_FIRMWARE("facetimehd/9112_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1771_01XX.dat");
 MODULE_FIRMWARE("facetimehd/1874_01XX.dat");

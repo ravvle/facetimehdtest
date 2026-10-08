@@ -26,7 +26,7 @@ sudo ./tests/hw-validate.sh          # a few minutes, one section per open item
 ```
 
 Open a **Hardware report** issue with the output. A failing report is as useful
-as a passing one; several entries under "Hardware validation status" in
+as a passing one; several entries under "Validation" in
 [`src/facetimehd/DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md) are waiting on
 exactly this.
 
@@ -88,7 +88,7 @@ that make working on them acceptable are in
 - GET first. A recovered value may reach V4L2 only as a **read-only** control,
   and only once hardware evidence supports its meaning.
 
-Anything inferred goes in DOWNSTREAM.md's "Hardware validation status" list
+Anything inferred goes in DOWNSTREAM.md's "Validation" list
 until hardware confirms it.
 
 ## Licensing

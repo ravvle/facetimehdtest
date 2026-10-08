@@ -660,6 +660,18 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 	case 0x190:
 		filename = "facetimehd/1222_01XX.dat";
 		break;
+	case 0x248:
+		/* MacBookPro14,1 reports 0005 0248.  Apple's Windows driver picks
+		 * on sensor_id0 >> 4 here, not sensor_id0. */
+		switch (dev_priv->sensor_id0 >> 4) {
+		case 5:
+			filename = "facetimehd/1575_01XX.dat";
+			break;
+		default:
+			filename = "facetimehd/1571_01XX.dat";
+			break;
+		}
+		break;
 	case 0x8830:
 		filename = "facetimehd/9112_01XX.dat";
 		break;
@@ -859,20 +871,38 @@ int fthd_isp_cmd_channel_camera_config_select(struct fthd_private *dev_priv, int
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CAMERA_CONFIG_SELECT, &cmd, sizeof(cmd), &len);
 }
 
+/*
+ * The firmware takes an origin and a size.  A window that leaves the sensor
+ * array, or one whose width and x offset are both odd, is accepted and then
+ * starves the channel until firmware reloads, so neither is ever sent.
+ * fthd_v4l2_set_crop() already guarantees both; this is the last line.
+ */
 int fthd_isp_cmd_channel_crop_set(struct fthd_private *dev_priv, int channel,
-				  int x1, int y1, int x2, int y2)
+				  int x, int y, int width, int height)
 {
 	struct isp_cmd_channel_set_crop cmd;
+	unsigned int sw = dev_priv->sensor_width;
+	unsigned int sh = dev_priv->sensor_height;
 	int len;
 
-	pr_debug("set crop: [%d, %d] -> [%d, %d]\n", x1, y1, x2, y2);
+	pr_debug("set crop: %dx%d at [%d, %d]\n", width, height, x, y);
+
+	if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
+	    (sw && (unsigned int)x + width > sw) ||
+	    (sh && (unsigned int)y + height > sh) ||
+	    ((x & 1) && (width & 1))) {
+		dev_err(&dev_priv->pdev->dev,
+			"refusing crop %dx%d at %d,%d on a %ux%u sensor\n",
+			width, height, x, y, sw, sh);
+		return -ERANGE;
+	}
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
-	cmd.x1 = x1;
-	cmd.y1 = y1;
-	cmd.y2 = y2;
-	cmd.x2 = x2;
+	cmd.x = x;
+	cmd.y = y;
+	cmd.width = width;
+	cmd.height = height;
 	len = sizeof(cmd);
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CROP_SET, &cmd, sizeof(cmd), &len);
 }
@@ -895,26 +925,19 @@ int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int ch
 	 * made the hardcoded x*2 both a correct stride and an unremarkable
 	 * constant, so nothing distinguished the two readings.
 	 *
-	 * The semi-planar format did: with x*2 still being sent for a
-	 * one-byte-per-pixel luma
-	 * plane, the ISP wrote luma rows 2560 bytes apart into a buffer laid out
-	 * for 1280, leaving every odd row of the captured frame zero - exactly
-	 * 50% of the luma plane, in a strict every-other-row pattern - and
-	 * scattering the chroma. It raised no IOMMU fault, because sizeimage
-	 * still covered what it wrote; the corruption was silent, and only
-	 * inspecting the planes separately found it.
-	 *
-	 * Passing bytesperline is therefore not a new guess: for YUYV and YVYU
-	 * it is width*2 and this command is byte-for-byte what it always was.
+	 * The semi-planar format did: with x*2 sent for a one-byte-per-pixel
+	 * luma plane, the ISP writes luma rows at double spacing, leaving every
+	 * odd row zero.  No IOMMU fault is raised, because sizeimage still
+	 * covers what it writes.  For YUYV bytesperline is width*2 anyway.
 	 */
 	cmd.x2 = stride;
 	cmd.x3 = x;
 	cmd.y1 = y;
 
 	/* pixel formats:
-	 * 0 - plane 0 Y plane 1 UV
+	 * 0 - NV12
 	   1 - YUYV
-	   2 - YVYU
+	   2 - YVYU (writes invalid chroma; never requested)
 	*/
 	cmd.pixelformat = pixelformat;
 	cmd.unknown3 = 0;
@@ -1032,6 +1055,10 @@ int fthd_isp_cmd_channel_streaming_mode(struct fthd_private *dev_priv, int chann
 	len = sizeof(cmd);
 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_STREAMING_MODE_SET, &cmd, sizeof(cmd), &len);
 }
+
+/* AE frame-rate window bound, in the ISP's Q8.8 fps units.  The sensor runs at
+ * 29.97 fps and the firmware clamps to that, reading back 7672. */
+#define FTHD_AE_FRAME_RATE (30 * 256)
 
 int fthd_isp_cmd_channel_frame_rate_min(struct fthd_private *dev_priv, int channel, int rate)
 {
@@ -1703,7 +1730,8 @@ int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enab
 
 int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 {
-	int ret, x1 = 0, y1 = 0, x2 = 0, y2 = 0, pixelformat;
+	struct v4l2_rect *crop = &dev_priv->fmt.crop;
+	int ret, pixelformat;
 
 	ret = fthd_isp_cmd_channel_camera_config(dev_priv);
 	if (ret)
@@ -1712,34 +1740,21 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	if (ret)
 		return ret;
 
-	/* Crop a rectangle of the sensor array and let the ISP scale it to
-	 * whatever output size was negotiated.  Cropping to the *output* size is
-	 * not a scale at all: it selects that many pixels starting at (0,0) and
-	 * hands them back 1:1, so every resolution below native came out as a
-	 * zoom into the top-left corner of the image.
-	 *
-	 * The rectangle is whatever S_SELECTION last accepted, which defaults to
-	 * the full array; fthd_v4l2_reset_crop() derives that default from the
-	 * detected sensor geometry rather than a constant, because the 12-inch
-	 * MacBook (MacBook8,1, sensor 1675) reports an 848x588 sensor via
-	 * CISP_CMD_CH_CAMERA_CONFIG_GET and a hardcoded 1280x720 crop exceeds
-	 * that array and makes the sensor interface throw SIF errors. */
+	/* Crop a rectangle of the sensor array and let the ISP scale it to the
+	 * negotiated output size.  The rectangle is whatever S_SELECTION set,
+	 * or else the largest centred window with the output's aspect ratio.
+	 * Re-fitted here because this is where the real sensor geometry (848x588
+	 * on the 12-inch MacBook, not 1280x720) is first known. */
 	fthd_v4l2_refresh_crop(dev_priv);
-	x1 = dev_priv->fmt.x1;
-	y1 = dev_priv->fmt.y1;
-	x2 = dev_priv->fmt.x2;
-	y2 = dev_priv->fmt.y2;
 
-	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x1, y1, x2, y2);
+	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, crop->left, crop->top,
+					    crop->width, crop->height);
 	if (ret)
 		return ret;
 
 	switch(dev_priv->fmt.fmt.pixelformat) {
 	case V4L2_PIX_FMT_YUYV:
 		pixelformat = 1;
-		break;
-	case V4L2_PIX_FMT_YVYU:
-		pixelformat = 2;
 		break;
 	case V4L2_PIX_FMT_NV12:
 		/* Semi-planar 4:2:0 output.  fthd_v4l2_adjust_format() sized the
@@ -1802,10 +1817,10 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_face_detection_start(dev_priv, 0);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0, dev_priv->frametime * 256);
+	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0, FTHD_AE_FRAME_RATE);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0, dev_priv->frametime * 256);
+	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0, FTHD_AE_FRAME_RATE);
 	if (ret)
 		return ret;
 	ret = fthd_isp_cmd_channel_temporal_filter_start(dev_priv, 0);
@@ -1827,7 +1842,7 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_start(dev_priv);
 	if (ret)
 		return ret;
-	msleep(1000); /* Needed to settle AE */
+	msleep(200); /* Needed to settle AE */
 	return 0;
 }
 
