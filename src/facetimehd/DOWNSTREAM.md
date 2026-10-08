@@ -224,7 +224,9 @@ replayed.
 - the AE frame-rate window: a 15 fps request delivers 15.00 fps with the
   firmware reading back `3840`/`3840`; in dim light, exposure priority drops a
   30 fps stream to about 15–18 fps (window `7672`/`1280`) while priority off
-  holds 29.97;
+  holds 29.97; requests of 30, 15, 10, 5 and 2 fps deliver 29.82, 15.01,
+  10.00, 5.00 and 2.00, `S_PARM` is refused while streaming, and `STREAMOFF`
+  at 2 fps returns every buffer;
 - five runtime-PM cycles;
 - suspend while streaming, with the viewer continuing;
 - `STREAMOFF` on signal;
