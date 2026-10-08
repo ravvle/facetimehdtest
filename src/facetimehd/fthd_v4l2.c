@@ -1196,22 +1196,16 @@ static int fthd_v4l2_ioctl_g_parm(struct file *filp, void *priv,
 {
 	struct fthd_private *dev_priv = video_drvdata(filp);
 
-	/* Always the rate actually delivered: the sensor's fixed FTHD_FPS
-	 * divided by the decimation in force.  A reported rate the stream does
-	 * not match makes GStreamer's pipewiresrc compute negative frame
-	 * durations and stall.  Expressed as divisor/FTHD_FPS so that rates
-	 * like 7.5 fps stay exact. */
-	struct v4l2_fract timeperframe = {
-		.numerator = dev_priv->fps_divisor,
-		.denominator = FTHD_FPS,
-	};
-
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
+	/* EXPERIMENT: reports the AE window S_PARM programmed, not a measured
+	 * rate.  Whether the sensor follows it is what this branch tests. */
 	parm->parm.capture.readbuffers = FTHD_BUFFERS;
 	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	parm->parm.capture.timeperframe = timeperframe;
+	parm->parm.capture.timeperframe.numerator = 256;
+	parm->parm.capture.timeperframe.denominator =
+		READ_ONCE(dev_priv->ae_frame_rate);
 	return 0;
 }
 
@@ -1220,38 +1214,20 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
 {
 	struct fthd_private *dev_priv = video_drvdata(filp);
 	struct v4l2_fract *tpf = &parm->parm.capture.timeperframe;
-	unsigned int divisor;
-	unsigned long flags;
+	u64 rate = FTHD_FPS * 256;
 
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
-
-	/* V4L2 spec: either field zero asks for the default rate. */
-	if (!tpf->numerator || !tpf->denominator) {
-		divisor = 1;
-	} else {
-		/* Round the requested interval to the nearest whole number of
-		 * sensor frames.  64-bit because a caller may legitimately pass
-		 * a large numerator to express a very slow rate. */
-		u64 frames = (u64)tpf->numerator * FTHD_FPS +
-			     tpf->denominator / 2;
-
-		do_div(frames, tpf->denominator);
-		if (frames < 1)
-			frames = 1;
-		if (frames > FTHD_MAX_FPS_DIVISOR)
-			frames = FTHD_MAX_FPS_DIVISOR;
-		divisor = frames;
+	if (tpf->numerator && tpf->denominator) {
+		rate = (u64)tpf->denominator * 256;
+		do_div(rate, tpf->numerator);
 	}
+	rate = clamp_t(u64, rate, 2 * 256, FTHD_FPS * 256);
 
-	/* Read by the buffer-return handler, which holds only this lock. */
-	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
-	dev_priv->fps_divisor = divisor;
-	dev_priv->frame_phase = 0;
-	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
-
-	/* Report back what was actually selected, which is what distinguishes
-	 * an accepted rate from a silently ignored one. */
+	/* The window is programmed at channel start, as upstream does. */
+	if (vb2_is_streaming(&dev_priv->vb2_queue))
+		return -EBUSY;
+	WRITE_ONCE(dev_priv->ae_frame_rate, (u32)rate);
 	return fthd_v4l2_ioctl_g_parm(filp, priv, parm);
 }
 
@@ -1472,13 +1448,14 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
 	 * sensor rate divided by a whole number of frames: k/FTHD_FPS for k in
 	 * 1..FTHD_MAX_FPS_DIVISOR.  A discrete list would either omit rates
 	 * S_PARM accepts or advertise ones it cannot hit exactly. */
-	interval->type = V4L2_FRMIVAL_TYPE_STEPWISE;
+	/* EXPERIMENT: S_PARM accepts 2-30 fps. */
+	interval->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
 	interval->stepwise.min.numerator = 1;
 	interval->stepwise.min.denominator = FTHD_FPS;
-	interval->stepwise.max.numerator = FTHD_MAX_FPS_DIVISOR;
-	interval->stepwise.max.denominator = FTHD_FPS;
+	interval->stepwise.max.numerator = 1;
+	interval->stepwise.max.denominator = 2;
 	interval->stepwise.step.numerator = 1;
-	interval->stepwise.step.denominator = FTHD_FPS;
+	interval->stepwise.step.denominator = 1;
 
 	return 0;
 }
@@ -1614,6 +1591,11 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 		ret = fthd_isp_cmd_channel_ae(dev_priv, 0,
 				ctrl->val == V4L2_EXPOSURE_AUTO);
 		break;
+	case V4L2_CID_EXPOSURE_AUTO_PRIORITY:
+		dev_priv->exposure_auto_priority = ctrl->val;
+		ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0,
+				fthd_isp_ae_frame_rate_min(dev_priv));
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1667,6 +1649,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	/* Full rate until S_PARM asks for less. */
 	dev_priv->fps_divisor = 1;
 	dev_priv->frame_phase = 0;
+	dev_priv->ae_frame_rate = FTHD_FPS * 256;
 
 	ret = v4l2_device_register(&dev_priv->pdev->dev, v4l2_dev);
 	if (ret) {
@@ -1707,7 +1690,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	if (ret)
 		goto fail_vdev_alloc;
 
-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
+	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 9);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
@@ -1728,6 +1711,8 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
 			       V4L2_EXPOSURE_MANUAL, 0,
 			       V4L2_EXPOSURE_AUTO);
+	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+			  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
 	/* Read-only: registering it adds a GET the application can ask for and
 	 * no SET the framework can replay. */
 	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,

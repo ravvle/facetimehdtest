@@ -1038,6 +1038,20 @@ int fthd_isp_cmd_channel_streaming_mode(struct fthd_private *dev_priv, int chann
  * 29.97 fps and the firmware clamps to that, reading back 7672. */
 #define FTHD_AE_FRAME_RATE (30 * 256)
 
+/* EXPERIMENT: the slowest rate AE may fall back to.  With exposure priority it
+ * may drop to 5 fps to lengthen exposure; otherwise it is pinned to the rate
+ * S_PARM asked for. */
+#define FTHD_AE_FPS_MIN (5 * 256)
+
+int fthd_isp_ae_frame_rate_min(struct fthd_private *dev_priv)
+{
+	u32 rate = dev_priv->ae_frame_rate ? : FTHD_AE_FRAME_RATE;
+
+	if (dev_priv->exposure_auto_priority && rate > FTHD_AE_FPS_MIN)
+		rate = FTHD_AE_FPS_MIN;
+	return rate;
+}
+
 int fthd_isp_cmd_channel_frame_rate_min(struct fthd_private *dev_priv, int channel, int rate)
 {
 	struct isp_cmd_channel_frame_rate_set cmd;
@@ -1666,10 +1680,12 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_face_detection_start(dev_priv, 0);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0, FTHD_AE_FRAME_RATE);
+	ret = fthd_isp_cmd_channel_frame_rate_max(dev_priv, 0,
+						  dev_priv->ae_frame_rate ? : FTHD_AE_FRAME_RATE);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0, FTHD_AE_FRAME_RATE);
+	ret = fthd_isp_cmd_channel_frame_rate_min(dev_priv, 0,
+						  fthd_isp_ae_frame_rate_min(dev_priv));
 	if (ret)
 		return ret;
 	ret = fthd_isp_cmd_channel_temporal_filter_start(dev_priv, 0);

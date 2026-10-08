@@ -144,6 +144,10 @@ struct fthd_private {
 	 * back to the ISP from @requeue_work; @frame_phase counts within the
 	 * current group.  Both are read and written only under buffer_lock. */
 	unsigned int fps_divisor;
+	/* EXPERIMENT: S_PARM programs the ISP AE frame-rate window instead of
+	 * decimating.  Q8.8 fps, as the firmware takes it. */
+	u32 ae_frame_rate;
+	bool exposure_auto_priority;
 	unsigned int frame_phase;
 	struct work_struct requeue_work;
 	unsigned int sequence;

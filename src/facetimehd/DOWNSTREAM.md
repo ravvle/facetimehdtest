@@ -97,6 +97,12 @@ driver passes `bytesperline`. Upstream hardcodes `width * 2`. With a
 one-byte-per-pixel plane, that makes the ISP write luma rows at double spacing.
 Half the frame comes out blank, with no IOMMU fault.
 
+> **Branch `ae-window-experiment` only.** `S_PARM` here programs the AE
+> frame-rate window (2–30 fps, `-EBUSY` while streaming) instead of decimating,
+> and `exposure_auto_priority` lets the window's minimum fall to 5 fps, as
+> upstream does. It exists to measure whether the window changes the delivered
+> rate; it is not for master until that is answered.
+
 ## Frame rate
 
 `S_PARM` delivers the requested rate exactly. It does this by decimation: one
