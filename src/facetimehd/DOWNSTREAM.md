@@ -229,7 +229,8 @@ replayed.
 
 **Validated** on a MacBookAir7,2, firmware 1.43.0, Ubuntu 7.0 kernels:
 - probe and DDR;
-- 57/57 applicable `v4l2-compliance` tests;
+- 57/57 applicable `v4l2-compliance` tests, `CREATE_BUFS` streaming included,
+  with no warnings;
 - NV12 planes checked against YUYV;
 - decimation at divisors 1–30, within 2.7% apart from the divisor-1 reading
   under "Open";
@@ -243,7 +244,7 @@ replayed.
   the programmed `(x, y, width, height)`.
 
 **Not yet run on hardware since the last driver change:**
-- Eight queued buffers (`v4l2-ctl` queues four), and `VIDIOC_CREATE_BUFS`.
+- Eight queued buffers (`v4l2-ctl` queues four).
 - The 200 ms AE settle, as distinct from a later frame. Both were validated
   upstream on other models.
 
