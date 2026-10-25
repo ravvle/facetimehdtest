@@ -4,11 +4,7 @@ on:
   push:
     branches: ['**']
   pull_request:
-  # The point of this project is that it keeps working without anyone touching
-  # it. That only holds if something notices when a new kernel release breaks
-  # it, so the whole matrix runs weekly regardless of commits.
-  schedule:
-    - cron: '17 5 * * 1'
+  # No schedule: CI runs only on push, pull request, or a manual dispatch.
   workflow_dispatch:
 
 permissions:

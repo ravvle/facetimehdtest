@@ -35,7 +35,7 @@ upstream `master` today, it adds:
   - failures reported to applications instead of blocking them.
 
 The full list, and what has and has not been validated on hardware, is in
-[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md). CI builds the driver weekly
+[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md). CI builds the driver
 for kernels 5.15 through 7.1; older kernels are not supported.
 
 ## What the installer does
@@ -407,7 +407,7 @@ sudo ./scripts/uninstall.sh --keep-tuning
   fingerprint, and stages the result under `/usr/src/`.
 - DKMS rebuilds the module for future kernel updates automatically.
 - CI runs shell checks, GCC and Clang kernel builds, and Sparse analysis across
-  the supported distribution matrix, plus a weekly watchdog on Apple's
+  the supported distribution matrix, plus a watchdog on Apple's
   downloads.
 
 Driver fixes belong in `src/facetimehd/`, should be recorded in

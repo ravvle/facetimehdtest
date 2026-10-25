@@ -60,7 +60,7 @@ sudo ./tests/hw-validate.sh --reboot          # reboots; re-run after to read th
 sudo ./scripts/extract-firmware.sh [--dest DIR] [-x DRIVER_FILE] [-i]
 
 # Are Apple's downloads still there and still what the checksum tables expect?
-# Installs nothing, needs no root. This is what the weekly CI watchdog runs.
+# Installs nothing, needs no root. This is what the CI watchdog runs.
 ./scripts/extract-firmware.sh --check-sources
 
 # Distribution packages (both write to packaging/out/)
@@ -90,7 +90,7 @@ sudo ./scripts/uninstall.sh [--keep-tuning]
 sudo ./scripts/macbook-tune.sh [--revert|--skip-fan]
 ```
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs shellcheck, an executable-bit check on `setup.sh`, `scripts/*.sh`, `tests/*.sh` and `packaging/*.sh`, the script smoke test, both package builds, the Apple-download watchdog, the driver build across Ubuntu 22.04/24.04/26.04 + Fedora 44 + AlmaLinux 10, and strict Clang and Sparse analysis — on every push and weekly on a schedule. The weekly run is the point: it catches breakage with nobody touching the repo.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs shellcheck, an executable-bit check on `setup.sh`, `scripts/*.sh`, `tests/*.sh` and `packaging/*.sh`, the script smoke test, both package builds, the Apple-download watchdog, the driver build across Ubuntu 22.04/24.04/26.04 + Fedora 44 + AlmaLinux 10, and strict Clang and Sparse analysis — on every push and pull request, or on demand via `workflow_dispatch`. There is no scheduled run: breakage from a new kernel or a changed Apple download is only caught when CI is triggered.
 
 **There are two ways this project breaks without anyone touching it, and each has a watchdog.** The build matrix catches a new kernel dropping an API the driver uses. The `apple-sources` job catches the other half: the firmware and calibration both come from Apple-hosted URLs with SHA-256 tables in `extract-firmware.sh`, and if Apple retires or republishes either, every new install breaks and the first anyone would otherwise know is a bug report. It downloads ~4 MB, verifies it, and writes nothing — no Apple content is stored, so it is a checksum comparison rather than a redistribution. It is skipped on pull requests, because a fork's CI has no business hammering Apple's CDN and a failure there is never caused by the diff under review.
 
