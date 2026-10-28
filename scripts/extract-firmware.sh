@@ -13,7 +13,8 @@
 # it is not in this repository. This script downloads the byte range of an
 # Apple-hosted OS X 10.11.5 update that contains the AppleCameraInterface kext,
 # carves the firmware out of it, verifies both against known SHA-256 values, and
-# installs it. This is the only step in the project that touches the network.
+# installs it. This is the only step in the project that touches the network
+# (and, for the calibration files only, it may fetch 7-Zip to unpack them).
 #
 # Changes from upstream: staging happens in a private mktemp directory instead
 # of fixed /tmp paths, curl verifies TLS certificates, the unused --dmg path
@@ -112,6 +113,16 @@ BOOTCAMP_RANGE='2337987-3492508'
 BOOTCAMP_MEMBER_HEADER=98
 SYS_NAME='AppleCamera.sys'
 
+# AppleCamera64.exe is a *solid* RAR3, and not every distribution can unpack
+# one: AlmaLinux 10 has no unar, EPEL's unrar is unrar-free (which cannot read
+# solid archives), and its bsdtar and 7zip are built without RAR support. When
+# nothing installed can, fall back to the official 7-Zip Linux build, which can.
+# It is fetched into the private work directory, refused unless its SHA-256
+# matches, used for this one unpack and deleted with everything else. Bump the
+# version and hash together, from the release's own published digest.
+SEVENZIP_URL='https://github.com/ip7z/7zip/releases/download/26.04/7z2604-linux-x64.tar.xz'
+SEVENZIP_SHA256='fc0327ba27e89bd086cf426dff17d77de582953cdbbc10a6576540a06853ffcd'
+
 # Where each set file sits inside AppleCamera.sys, keyed by the SHA-256 of the
 # .sys - the same key the firmware tables above use, because it is the same
 # file. Format: name:skip:count. Offsets are upstream's (see the project wiki,
@@ -158,8 +169,10 @@ FaceTime HD camera firmware from it, and installs it as firmware.bin.
       --with-calibration
                       Also fetch the sensor calibration (.dat) files. These fix
                       the camera's colours and live only in the Windows Boot
-                      Camp driver, so this is a second ~1.2 MB download and
-                      needs unar (or unrar) to unpack it.
+                      Camp driver, so this is a second ~1.2 MB download. It
+                      is unpacked with unar, unrar or 7-Zip; if none of those
+                      installed can read it, the official 7-Zip build is
+                      fetched (~1.6 MB, SHA-256 checked) and used once.
       --calibration-only
                       Fetch only the calibration files; leave firmware.bin
                       alone. Use when the firmware is already installed.
@@ -327,16 +340,39 @@ fi
 # id (see fthd_isp_cmd_set_loadfile), but they total under 100 kB, so install
 # all of them and let any machine find its own.
 
-# A --check-sources run on a machine with no unpacker cannot check the
-# calibration archive. That is a gap in the checking environment, not a broken
-# Apple download, so it is reported as skipped rather than failed - otherwise
-# the watchdog would blame Apple every time a CI image drops unar.
-if [ "$CHECK_SOURCES" -eq 1 ] && [ "$DO_CALIBRATION" -eq 1 ] && [ -z "$SYS_FILE" ] &&
-   ! have unar && ! have unrar; then
-    warn "Neither unar nor unrar is installed; the calibration source cannot be checked."
-    CALIBRATION_SKIPPED=1
-    DO_CALIBRATION=0
-fi
+# Unpack the RAR at $1 into the directory $2 with the tool $3, which is a
+# command name or, for the fetched 7-Zip, a path. Success means AppleCamera.sys
+# came out, not that the tool exited 0: unrar-free and a 7z built without RAR
+# support are both installed under the right names and both fail here.
+rar_unpack() {
+    local exe="$1" out="$2" tool="$3"
+    rm -rf -- "$out"
+    mkdir -p -- "$out"
+    case "$tool" in
+        unar)  unar -q -f -o "$out" "$exe" ;;
+        unrar) unrar x -y -inul "$exe" "$out/" ;;
+        *)     "$tool" x -y -bso0 -bsp0 -bse0 -o"$out" "$exe" ;;
+    esac >/dev/null 2>&1 || true
+    find "$out" -name "$SYS_NAME" -type f -size +0 -print -quit 2>/dev/null
+}
+
+# Fetch the official 7-Zip build into the work directory and print the path of
+# its 7zz binary. Fails, printing nothing, if it cannot be had or its checksum
+# does not match.
+fetch_7zz() {
+    local tarball="$TMPDIR_WORK/7zip.tar.xz" dir="$TMPDIR_WORK/7zip"
+    [ "$(uname -m)" = x86_64 ] || return 1
+    { have tar && have xz; } || return 1
+    curl -fsSL -o "$tarball" "$SEVENZIP_URL" || return 1
+    if [ "$(sha256 "$tarball")" != "$SEVENZIP_SHA256" ]; then
+        warn "7-Zip download has an unexpected SHA-256; not using it."
+        return 1
+    fi
+    mkdir -p -- "$dir"
+    tar -xJf "$tarball" -C "$dir" 7zz || return 1
+    [ -x "$dir/7zz" ] || return 1
+    printf '%s\n' "$dir/7zz"
+}
 
 if [ "$DO_CALIBRATION" -eq 1 ]; then
     if [ "$CHECK_SOURCES" -eq 1 ]; then
@@ -351,17 +387,6 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
         info "Using local $SYS_FILE"
     else
         require_cmds sha256sum awk dd curl zcat
-        # unar handles solid RAR3, which this archive is; unrar-free does not,
-        # so it is not an acceptable substitute. The proprietary unrar works.
-        unpacker=''
-        for c in unar unrar; do have "$c" && { unpacker="$c"; break; }; done
-        [ -n "$unpacker" ] || die \
-            "Need unar (or unrar) to unpack the Boot Camp driver.
-       Install it with: apt install unar   /   dnf install unar
-       On Enterprise Linux (AlmaLinux, Rocky, RHEL) unar is in EPEL:
-           dnf install epel-release && dnf install unar
-       Or supply an unpacked AppleCamera.sys with --sys FILE."
-
         info "This fetches ~1.2 MB of $BOOTCAMP_URL"
         exe="$TMPDIR_WORK/AppleCamera64.exe"
 
@@ -377,17 +402,38 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
         [ -s "$exe" ] ||
             die "Download failed - no AppleCamera64.exe extracted. Check network access to download.info.apple.com."
 
-        ( cd -- "$TMPDIR_WORK" && case "$unpacker" in
-            unar)  unar -q -f -o unpacked "$exe" ;;
-            unrar) unrar x -y -inul "$exe" unpacked/ ;;
-          esac ) >/dev/null 2>&1 || true
+        unpacked="$TMPDIR_WORK/unpacked"
+        for c in unar unrar 7zz 7z; do
+            have "$c" || continue
+            SYS_FILE="$(rar_unpack "$exe" "$unpacked" "$c")"
+            [ -n "$SYS_FILE" ] && { info "Unpacked with $c"; break; }
+        done
 
-        SYS_FILE="$(find "$TMPDIR_WORK/unpacked" -name "$SYS_NAME" -type f -print -quit 2>/dev/null || true)"
-        if [ -z "$SYS_FILE" ] || [ ! -s "$SYS_FILE" ]; then
-            die "Could not unpack $SYS_NAME from the Boot Camp driver."
+        # A --check-sources run is a watchdog on Apple's downloads, so it does
+        # not reach for GitHub: with no working unpacker here it reports the
+        # calibration source as unchecked rather than failed, or it would blame
+        # Apple every time a CI image drops unar.
+        if [ -z "$SYS_FILE" ] && [ "$CHECK_SOURCES" -eq 1 ]; then
+            warn "Nothing here can unpack the solid RAR; the calibration source cannot be checked."
+            CALIBRATION_SKIPPED=1
+            DO_CALIBRATION=0
+        elif [ -z "$SYS_FILE" ]; then
+            info "No installed tool can unpack the solid RAR in the Boot Camp driver."
+            info "Fetching the official 7-Zip build for this one step (~1.6 MB)."
+            if sevenzip="$(fetch_7zz)" && [ -n "$sevenzip" ]; then
+                SYS_FILE="$(rar_unpack "$exe" "$unpacked" "$sevenzip")"
+            fi
+            [ -n "$SYS_FILE" ] || die \
+                "Could not unpack $SYS_NAME from the Boot Camp driver.
+       It is a solid RAR3: unar, RARLAB's unrar or 7-Zip with RAR support can
+       read it (unrar-free cannot), and fetching 7-Zip from
+       $SEVENZIP_URL failed.
+       Or supply an unpacked AppleCamera.sys with --sys FILE."
         fi
     fi
+fi
 
+if [ "$DO_CALIBRATION" -eq 1 ]; then
     sys_hash="$(sha256 "$SYS_FILE")"
     layout="${CALIBRATION_LAYOUT[$sys_hash]:-}"
     if [ -z "$layout" ]; then
@@ -458,7 +504,7 @@ if [ "$CHECK_SOURCES" -eq 1 ]; then
     echo
     ok "Apple firmware source is reachable and matches the checksum table."
     if [ "$CALIBRATION_SKIPPED" -eq 1 ]; then
-        warn "The calibration source was NOT checked (no unar/unrar here)."
+        warn "The calibration source was NOT checked (no RAR unpacker here)."
     else
         ok "Boot Camp calibration source is reachable and matches its table."
     fi

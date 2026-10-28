@@ -367,7 +367,13 @@ if [ "$PKG_FAMILY" = rpm ]; then
     # rebuilds from scratch. elfutils-libelf-devel is what the kernel build
     # system needs and does not pull in itself; it is in AppStream on EL10, so
     # it needs no extra repository.
-    DEPS=(gcc make cpio diffutils dkms elfutils-libelf-devel gzip kmod xz)
+    #
+    # openssl is how DKMS makes the key it signs the module with ("openssl not
+    # found, can't generate key and certificate"). EPEL's dkms only Recommends
+    # it, so a system with weak dependencies off has none, and under Secure
+    # Boot an unsigned module does not load. tar unpacks the 7-Zip build the
+    # calibration step falls back on where nothing packaged reads solid RAR.
+    DEPS=(gcc make cpio diffutils dkms elfutils-libelf-devel gzip kmod openssl tar xz)
 
     # curl is asked for by name only when it is actually absent. The RPM
     # families' default installs carry curl-minimal, which already provides
@@ -376,7 +382,7 @@ if [ "$PKG_FAMILY" = rpm ]; then
     # dependency step on a stock AlmaLinux or Fedora system.
     have curl || DEPS+=(curl)
 else
-    DEPS=(build-essential cpio curl dkms gzip kmod xz-utils)
+    DEPS=(build-essential cpio curl dkms gzip kmod openssl xz-utils)
 fi
 
 pkg_install "${DEPS[@]}" || die \
@@ -389,13 +395,14 @@ pkg_install "${DEPS[@]}" || die \
 
 # Everything above is needed to build and install the driver, so failing to get
 # it is fatal. These three are not: pciutils only powers the hardware check,
-# v4l-utils only the verification advice at the end, and unar only the sensor
-# calibration files. They are installed the same way, but a distribution that
-# does not package one of them costs a diagnostic or the camera's colours - not
-# a working camera - and refusing to install over that would be wrong.
+# v4l-utils only the verification advice at the end, and unar only unpacks the
+# sensor calibration files. They are installed the same way, but a distribution
+# that does not package one of them costs a diagnostic - not a working camera -
+# and refusing to install over that would be wrong.
 #
-# unar is the realistic case. It comes from EPEL on Enterprise Linux, and EPEL
-# does not rebuild every Fedora package for every EL release.
+# unar is the realistic case: EPEL has none for EL10. Its absence no longer
+# costs the calibration either, because the extractor then fetches 7-Zip to
+# unpack the archive itself.
 EXTRAS=()
 
 # Queue one such package, named by the command it provides so that an already
@@ -413,21 +420,14 @@ want_extra() {
     return 1
 }
 
-HAVE_UNAR=1
 want_extra pciutils  lspci    || true
 want_extra v4l-utils v4l2-ctl || true
-want_extra unar      unar     || HAVE_UNAR=0
+want_extra unar      unar     ||
+    info "The calibration step will fetch 7-Zip to unpack its archive instead."
 
 if [ ${#EXTRAS[@]} -gt 0 ] && ! pkg_install "${EXTRAS[@]}"; then
     warn "Could not install: ${EXTRAS[*]}"
     warn "Continuing - none of these is needed to build or load the driver."
-    have unar || HAVE_UNAR=0
-fi
-
-if [ "$HAVE_UNAR" -eq 0 ]; then
-    warn "Without unar the sensor calibration files cannot be unpacked. The"
-    warn "camera will work; its colours will be off. Install unar later and"
-    warn "re-run 'sudo $FIRMWARE_EXTRACTOR --calibration-only' to fix that."
 fi
 
 # Headers for the running kernel, so we can build right now, plus whatever
@@ -738,11 +738,9 @@ fi
 # The sensor calibration files are a separate concern from the firmware: they
 # come from a different Apple download (the Windows Boot Camp driver, the only
 # thing that ships them), and they fix its colours. This step runs on every
-# install that has unar, but a failure here is still a warning, never fatal:
-# the camera streams without them, just with the wrong colours.
-if [ "$SKIP_FIRMWARE" -eq 0 ] && [ "$HAVE_UNAR" -eq 0 ]; then
-    step "Skipping the sensor calibration files (no unar)"
-elif [ "$SKIP_FIRMWARE" -eq 0 ]; then
+# install, but a failure here is still a warning, never fatal: the camera
+# streams without them, just with the wrong colours.
+if [ "$SKIP_FIRMWARE" -eq 0 ]; then
     if compgen -G "$FW_DIR/*_01XX.dat" >/dev/null && [ "$FORCE_REBUILD" -eq 0 ]; then
         step "Sensor calibration files already present"
     else

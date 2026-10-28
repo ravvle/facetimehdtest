@@ -70,7 +70,8 @@ sudo ./scripts/extract-firmware.sh [--dest DIR] [-x DRIVER_FILE] [-i]
 # One-file bug report, redacting the DMI serial and UUID
 ./scripts/collect-diagnostics.sh
 
-# Sensor calibration (.dat) files - a separate Apple download, needs unar
+# Sensor calibration (.dat) files - a separate Apple download; unpacked with
+# unar/unrar/7-Zip, or a SHA-256-pinned 7-Zip fetched when none can
 sudo ./scripts/extract-firmware.sh --calibration-only
 sudo ./scripts/extract-firmware.sh --calibration-only --sys /path/AppleCamera.sys
 
@@ -110,7 +111,8 @@ of it.
 **The maintained driver source is included.** The fork lives under
 [src/facetimehd/](src/facetimehd/) and installing does not fetch source from
 GitHub. The one networked project step is firmware extraction from Apple's
-servers, because that firmware cannot legally be redistributed.
+servers, because that firmware cannot legally be redistributed (plus, only when
+no installed tool can unpack the calibration archive, a pinned 7-Zip build).
 
 **Sensor calibration is a second, independent download.** The `NNNN_01XX.dat`
 set files fix the camera's colours and exist *only* in the Windows Boot Camp
@@ -118,12 +120,19 @@ driver — the OS X kext does not carry them, so the firmware download cannot
 supply them. `extract-firmware.sh` range-fetches just the
 `AppleCamera64.exe` member out of the 542 MB `bootcamp5.1.5769.zip` (~1.2 MB),
 inflates it with a synthesised gzip header rather than a zip tool, unpacks the
-solid RAR with `unar`, and carves the four files at offsets keyed by the
+solid RAR, and carves the four files at offsets keyed by the
 SHA-256 of `AppleCamera.sys` — which is the *same* hash table the firmware path
 already uses, because it is the same file. Each carved file is SHA-256 verified,
-so a wrong offset installs nothing. `unrar-free` cannot read solid RAR3 and is
-not a substitute. The camera works without all of this, so `install.sh` treats
-every failure here as a warning.
+so a wrong offset installs nothing. The unpacker is whichever of `unar`,
+`unrar`, `7zz` or `7z` actually yields `AppleCamera.sys` - each is *tried*,
+because `unrar-free` (EPEL's `unrar`) and RAR-less 7-Zip builds (Fedora's and
+EPEL's) are installed under those names and cannot read solid RAR3. When none
+works, it downloads the official 7-Zip Linux build pinned by URL and SHA-256
+(`SEVENZIP_URL`/`SEVENZIP_SHA256`), uses its `7zz` once from the work directory,
+and deletes it - AlmaLinux 10 has no packaged tool that can do this at all.
+`--check-sources` never takes that fallback: it watches Apple, and a GitHub
+failure must not read as Apple's. The camera works without all of this, so
+`install.sh` treats every failure here as a warning.
 
 **Firmware extraction is ours** ([scripts/extract-firmware.sh](scripts/extract-firmware.sh)). It is derived from `patjak/facetimehd-firmware`, which died in 2020, and is maintained here under GPL-2.0-only. It downloads a byte range of an Apple-hosted OS X 10.11.5 update, carves the firmware out of the `AppleCameraInterface` kext, and SHA-256-verifies both the kext and the image. Only firmware 1.43.0 actually works.
 
@@ -169,7 +178,7 @@ there. Read the following before "fixing" any of it:
 - **Debugfs is created in `probe()` and destroyed in `remove()`, never across a suspend.** `debugfs_create_devm_seqfile()` is devm-managed, and runtime PM makes a suspend/resume cycle happen every few idle seconds, so tearing the tree down and rebuilding it each time leaks a devres entry. The accessors take a runtime-PM reference instead — reading one powers the camera up.
 - **The whole project is GPL-2.0-only.** `scripts/` was MIT until 2026-08, when absorbing the GPL-2.0-only firmware extractor into `scripts/extract-firmware.sh` required relicensing the lot. Derived code must keep its upstream attribution header — do not quietly reword provenance away.
 - **`diffutils` is in the RPM dependency list on purpose.** It is Essential on Debian and so never listed there, but a minimal Fedora has no `diff` at all — and the rebuild-skip in `install.sh` is a `diff -rq` whose failure is swallowed. Without it the installer silently loses idempotency and rebuilds every run.
-- **`install.sh` splits its dependencies into required and best-effort, and the split is not arbitrary.** A compiler, make, dkms, kmod, cpio, curl, gzip, xz, `diffutils` and `elfutils-libelf-devel` are what build and install the driver: failing to get one is fatal. `pciutils`, `v4l-utils` and `unar` are not — they power the hardware check, the closing verification advice and the sensor calibration respectively. Losing one of those costs a diagnostic or the camera's colours, never a working camera, so refusing to install over it would be wrong. `unar` is still installed wherever it exists and the calibration step still runs on every install that has it; it is only whether it is *available* that varies, because it comes from EPEL on Enterprise Linux and EPEL does not rebuild every Fedora package for every EL release.
+- **`install.sh` splits its dependencies into required and best-effort, and the split is not arbitrary.** A compiler, make, dkms, kmod, cpio, curl, gzip, xz, `openssl`, `diffutils`, `elfutils-libelf-devel` and (RPM) `tar` are what build, sign and install the driver: failing to get one is fatal. `openssl` is there because DKMS generates its signing key with it and EPEL's dkms only *Recommends* it, so with weak dependencies off DKMS prints "openssl not found, can't generate key and certificate" and an unsigned module will not load under Secure Boot. `pciutils`, `v4l-utils` and `unar` are not — they power the hardware check, the closing verification advice and the preferred calibration unpacker respectively. Losing one of those costs a diagnostic, never a working camera, so refusing to install over it would be wrong. The calibration step runs on every install; without `unar` (EPEL 10 has none) the extractor falls back to the pinned 7-Zip, which is what `tar` is for.
 - **`curl` is only named as an RPM dependency when `/usr/bin/curl` is actually missing.** The RPM families' default installs carry `curl-minimal`, which already provides the binary, and `dnf install curl` *conflicts* with it rather than upgrading it. Listing `curl` unconditionally therefore breaks the entire dependency step on a stock AlmaLinux or Fedora system — a whole-install failure caused by a package that was already there.
 - **EPEL is enabled on the way in and left alone on the way out.** `uninstall.sh` does not remove it: by then other packages may depend on it, and tearing out a system-wide repository is a far more surprising thing for a camera uninstaller to do than leaving one enabled.
 - **Do not restore the removed inferred firmware controls from `953fe61`–`8e154f9`.** That series repeatedly hard-locked the MacBookAir7,2 after probe. Static analysis of firmware `S2ISP-01.43.00` proved that AE bias and AWB CCT submitted short payloads, test-pattern put its value in the wrong halfword, AWB gain was structurally wrong, and chroma suppression was not a one-value control. The old opt-in gates were removed with the interfaces: a module parameter is not adequate containment for a command capable of freezing the host. Read `src/facetimehd/FIRMWARE-REVERSE-ENGINEERING.md` before implementing any of them. Keep stream-resume, frame-decimation and mutable-crop work available for independent validation.

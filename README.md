@@ -45,7 +45,7 @@ for kernels 5.15 through 7.1; older kernels are not supported.
 - registers it with DKMS so it is rebuilt after kernel updates;
 - downloads an Apple update and extracts the proprietary camera firmware, which
   cannot be redistributed here;
-- installs the matching sensor calibration files where `unar` is available; and
+- installs the matching sensor calibration files; and
 - optionally installs and enables `mbpfan` to improve thermals.
 
 ## Origins and acknowledgements
@@ -129,11 +129,12 @@ dnf repolist --enabled | grep -E 'epel|crb'
 
 **AlmaLinux 10 is the first Enterprise Linux release this driver can be used
 on.** RHEL 9 and its rebuilds ship kernel 5.14, just below the 5.15 floor;
-RHEL 10's 6.12 clears it comfortably. `mbpfan` and `unar` also come from EPEL,
-and EPEL does not rebuild every Fedora package for every EL release — if either
-is missing, the installer says so and carries on. Neither is needed to build or
-load the driver; `unar` only unpacks the sensor calibration files, so without
-it the camera works but its colours are off.
+RHEL 10's 6.12 clears it comfortably. `mbpfan` also comes from EPEL, and EPEL
+does not rebuild every Fedora package for every EL release — if it is missing,
+the installer says so and carries on. `unar` is not in EPEL 10 at all, and
+nothing else AlmaLinux packages can read the calibration archive (EPEL's
+`unrar` is `unrar-free`; its `bsdtar` and `7zip` lack RAR support), so there
+the calibration step fetches the official 7-Zip build instead — see below.
 
 ## Installation
 
@@ -216,13 +217,18 @@ installing:
 /usr/lib/firmware/facetimehd/firmware.bin
 ```
 
-Sensor calibration files come from a separate Apple Boot Camp package and need
-`unar` to unpack. They are not required for capture, but missing calibration
-produces incorrect colours, so `install.sh` fetches them on every run where
-`unar` is present. Two things can leave a machine without them:
+Sensor calibration files come from a separate Apple Boot Camp package, inside
+a solid RAR. They are not required for capture, but missing calibration
+produces incorrect colours, so `install.sh` fetches them on every run. The
+archive is unpacked with `unar`, RARLAB's `unrar` or a RAR-capable 7-Zip,
+whichever is installed and works; if none is, the extractor downloads the
+official 7-Zip Linux build (~1.6 MB from `github.com/ip7z/7zip`), refuses it
+unless its SHA-256 matches the one pinned in `extract-firmware.sh`, uses it for
+that one unpack and deletes it. Two things can leave a machine without them:
 
-- **`unar` is missing**, which on Enterprise Linux means EPEL has not rebuilt
-  it for that release. The installer warns and continues.
+- **No unpacker, and no network access to GitHub** for the 7-Zip fallback.
+  The installer warns and continues; `--sys FILE` takes a pre-unpacked
+  `AppleCamera.sys` instead.
 - **Your sensor is not one of the four the download carries.** The driver
   recognises eleven; a machine needing one of the other seven logs
   `set file ... is missing` in `dmesg`, and `install.sh --status`

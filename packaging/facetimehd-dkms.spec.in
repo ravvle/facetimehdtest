@@ -20,10 +20,12 @@ BuildArch:      noarch
 Requires:       dkms >= 2.8
 Requires:       gcc
 Requires:       make
+# DKMS signs the module with a key it makes using openssl, and EPEL's dkms only
+# Recommends it - without it, an unsigned module will not load under Secure Boot.
+Requires:       openssl
 Recommends:     v4l-utils
-# unar is in EPEL on Enterprise Linux and EPEL does not rebuild every Fedora
-# package for every EL release, so this stays a weak dependency: without it the
-# camera works and its colours are wrong.
+# unar is not in EPEL for EL10, so this stays a weak dependency: without it the
+# calibration step fetches 7-Zip to unpack the Boot Camp driver instead.
 Recommends:     unar
 Suggests:       mbpfan
 
