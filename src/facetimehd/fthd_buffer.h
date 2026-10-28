@@ -48,7 +48,8 @@ struct iommu_obj {
 	struct resource base;
 	int size;
 	int offset;
-	unsigned int page_offset;
+	/* Byte offset of the buffer start within its first page */
+	unsigned int byte_offset;
 };
 
 struct h2t_buf_ctx {

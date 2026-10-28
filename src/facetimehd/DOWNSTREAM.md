@@ -1,7 +1,7 @@
 # How this driver differs from upstream
 
 This directory is a fork of [`patjak/facetimehd`](https://github.com/patjak/facetimehd).
-This file lists what it does that upstream `master` (`c9b063a`, 2026-10-05)
+This file lists what it does that upstream `master` (`6dc8cd8`, 2026-10-14)
 does not, and why. Delete an entry once upstream has it.
 
 Hardware results are from a MacBookAir7,2 with firmware 1.43.0 unless stated;
@@ -22,6 +22,12 @@ Hardware results are from a MacBookAir7,2 with firmware 1.43.0 unless stated;
 - `S_PARM` through the AE frame-rate window (2–30 fps, refused while
   streaming), and `V4L2_CID_EXPOSURE_AUTO_PRIORITY`.
 - Buffers returned when channel start fails.
+- Scatterlists walked with `for_each_sg()`, and buffers that start inside a
+  page (PipeWire's USERPTR memfds) mapped with the in-page offset added to the
+  descriptor address, so `VB2_USERPTR` is advertised. The field is
+  `byte_offset`, as upstream names it.
+- A failed `buf_prepare` undoes its partial setup, and `STREAMOFF` returns
+  buffers that never reached the firmware instead of waiting on them.
 
 ## Safety and correctness
 
@@ -32,9 +38,6 @@ Hardware results are from a MacBookAir7,2 with firmware 1.43.0 unless stated;
 - Firmware sees tracked ISP-memory indices and opaque VB2 generation tags,
   never kernel addresses or pointers. Buffer ownership is locked, and invalid
   returns are rate-limited in `dmesg`.
-- Scatterlists are walked properly, chained lists and unaligned first segments
-  included. This is why `VB2_USERPTR` stays enabled here, while upstream drops
-  it.
 - A firmware command timeout marks the ISP wedged. Command memory is never
   reused while firmware may still touch it, later commands fail fast with
   `-EIO`, and the next power cycle reloads the firmware.

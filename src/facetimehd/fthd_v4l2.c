@@ -373,8 +373,8 @@ static int fthd_buffer_prepare(struct vb2_buffer *vb)
 	dma_list->desc[0].count = 1;
 	dma_list->desc[0].pool = 0x02;
 
-	base = (ctx->plane[0]->offset << PAGE_SHIFT) |
-		ctx->plane[0]->page_offset | 0xc0000000;
+	base = ((ctx->plane[0]->offset << PAGE_SHIFT) | 0xc0000000) +
+		ctx->plane[0]->byte_offset;
 	dma_list->desc[0].addr0 = base;
 
 	/* iommu_allocate_sgtable() walks the scatterlist into one contiguous

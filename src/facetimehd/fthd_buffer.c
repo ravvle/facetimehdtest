@@ -31,7 +31,7 @@ struct iommu_obj *iommu_allocate_sgtable(struct fthd_private *dev_priv, struct s
 	struct resource *root = dev_priv->iommu;
 	struct scatterlist *sg;
 	resource_size_t total_pages = 0;
-	unsigned int page_offset = 0;
+	unsigned int byte_offset = 0;
 	unsigned int pages, page;
 	size_t dma_length;
 	int ret, i;
@@ -53,13 +53,16 @@ struct iommu_obj *iommu_allocate_sgtable(struct fthd_private *dev_priv, struct s
 			return NULL;
 
 		if (!i)
-			page_offset = offset_in_page(dma_addr);
-		else if (offset_in_page(dma_addr))
-			return NULL;
+			byte_offset = offset_in_page(dma_addr);
 
-		if (i + 1 < sgtable->nents &&
-		    offset_in_page(dma_addr + dma_length))
+		if ((i > 0 && offset_in_page(dma_addr)) ||
+		    (i + 1 < sgtable->nents &&
+		     offset_in_page(dma_addr + dma_length))) {
+			dev_err(&dev_priv->pdev->dev,
+				"Buffer segment %d is not page aligned (%pad, len %zu), refusing\n",
+				i, &dma_addr, dma_length);
 			return NULL;
+		}
 
 		pages = DIV_ROUND_UP(offset_in_page(dma_addr) + dma_length,
 				     PAGE_SIZE);
@@ -91,7 +94,7 @@ struct iommu_obj *iommu_allocate_sgtable(struct fthd_private *dev_priv, struct s
 
 	obj->offset = obj->base.start - root->start;
 	obj->size = total_pages;
-	obj->page_offset = page_offset;
+	obj->byte_offset = byte_offset;
 
 	pos = 0x9000 + obj->offset * 4;
 	for_each_sg(sgtable->sgl, sg, sgtable->nents, i) {
