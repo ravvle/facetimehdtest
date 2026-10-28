@@ -129,9 +129,11 @@ dnf repolist --enabled | grep -E 'epel|crb'
 
 **AlmaLinux 10 is the first Enterprise Linux release this driver can be used
 on.** RHEL 9 and its rebuilds ship kernel 5.14, just below the 5.15 floor;
-RHEL 10's 6.12 clears it comfortably. `mbpfan` also comes from EPEL, and EPEL
-does not rebuild every Fedora package for every EL release — if it is missing,
-the installer says so and carries on. `unar` is not in EPEL 10 at all, and
+RHEL 10's 6.12 clears it comfortably. `mbpfan` is not in EPEL 10, so
+`macbook-tune.sh` offers to build upstream release 2.4.0 from source (its
+tarball SHA-256-checked) and installs it with its systemd unit. Nor is
+`v4l2-compliance`: EL10's `v4l-utils` leaves it out, so
+`tests/smoke-capture.sh` skips that one section there. `unar` is not in EPEL 10 at all, and
 nothing else AlmaLinux packages can read the calibration archive (EPEL's
 `unrar` is `unrar-free`; its `bsdtar` and `7zip` lack RAR support), so there
 the calibration step fetches the official 7-Zip build instead — see below.
@@ -378,8 +380,8 @@ guided setup asks; it can also be added later by rerunning:
 sudo ./setup.sh
 ```
 
-The setup uses the distribution package and leaves mbpfan's own fan curve
-unchanged. Check it with:
+The setup uses the distribution package - or, where there is none, builds the
+pinned upstream release - and leaves mbpfan's own fan curve unchanged. Check it with:
 
 ```bash
 systemctl status mbpfan.service

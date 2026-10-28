@@ -13,6 +13,9 @@
 #
 # Needs v4l-utils. v4l2-compliance is the part that matters; the capture is
 # there because a driver can pass compliance and still never deliver a frame.
+# It is packaged separately on Fedora (v4l-utils-devel-tools) and not at all on
+# Enterprise Linux 10, whose v4l-utils leaves it out - so its absence skips that
+# one section, loudly, rather than refusing to test anything.
 
 set -euo pipefail
 
@@ -53,7 +56,9 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-require_cmds v4l2-ctl v4l2-compliance
+require_cmds v4l2-ctl
+HAVE_COMPLIANCE=1
+have v4l2-compliance || HAVE_COMPLIANCE=0
 [ "$DO_LOAD" -eq 0 ] || require_root
 
 has_facetimehd_hardware ||
@@ -147,14 +152,26 @@ fi
 # -s streams as part of the test; it is the only mode that exercises the queue
 # and format negotiation together.
 step "v4l2-compliance"
-if v4l2-compliance --device "$DEVICE" -s; then
+if [ "$HAVE_COMPLIANCE" -eq 0 ]; then
+    warn "v4l2-compliance is not installed, so this section was NOT run."
+    if is_debian_like; then
+        warn "Install it with: sudo apt install v4l-utils"
+    elif is_enterprise_linux; then
+        warn "Enterprise Linux does not package it; build v4l-utils from"
+        warn "https://git.linuxtv.org/v4l-utils.git, or run this on Fedora/Ubuntu."
+    else
+        warn "Install it with: sudo dnf install v4l-utils-devel-tools"
+    fi
+elif v4l2-compliance --device "$DEVICE" -s; then
     ok "v4l2-compliance passed"
 else
     bad "v4l2-compliance reported failures"
     rc=1
 fi
 
-if [ "$rc" -eq 0 ]; then
+if [ "$rc" -eq 0 ] && [ "$HAVE_COMPLIANCE" -eq 0 ]; then
+    ok "All checks that ran passed - v4l2-compliance was skipped"
+elif [ "$rc" -eq 0 ]; then
     ok "All checks passed"
 else
     error "Some checks failed - see above, and check dmesg for driver messages."

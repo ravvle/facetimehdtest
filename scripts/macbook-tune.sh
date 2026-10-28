@@ -24,6 +24,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR=/var/lib/facetimehd
 MBPFAN_ENABLED="$STATE_DIR/mbpfan.enabled-by-us"
 
+# Where no repository carries mbpfan - EPEL has none for EL10 - it is built from
+# this upstream release instead, refused unless the tarball's SHA-256 matches.
+# Bump the version and hash together.
+MBPFAN_VERSION=2.4.0
+MBPFAN_URL="https://github.com/linux-on-mac/mbpfan/archive/refs/tags/v$MBPFAN_VERSION.tar.gz"
+MBPFAN_SHA256=e1cdcffaba52be215ae40a8568949190866d500d6ae2a1e96b71ab5372f3580b
+
 ASSUME_YES=0
 ACTION=apply
 DO_FAN=1
@@ -108,6 +115,49 @@ pkg_manager >/dev/null ||
 # Fans
 # ---------------------------------------------------------------------------
 
+# Build the pinned mbpfan release and install what its 'make install' would,
+# plus the systemd unit it ships but does not install. An existing
+# /etc/mbpfan.conf is left alone, where 'make install' would overwrite it.
+build_mbpfan() {
+    local work src rc=0
+
+    pkg_install gcc make tar gzip curl >/dev/null || {
+        warn "Could not install the tools to build mbpfan (gcc, make, tar, gzip, curl)."
+        return 1
+    }
+
+    work="$(mktemp -d -t mbpfan-build.XXXXXXXX)"
+    src="$work/mbpfan-$MBPFAN_VERSION"
+    (
+        set -e
+        cd -- "$work"
+        curl -fsSL -o mbpfan.tar.gz "$MBPFAN_URL"
+        if [ "$(sha256sum mbpfan.tar.gz | awk '{ print $1 }')" != "$MBPFAN_SHA256" ]; then
+            echo "mbpfan $MBPFAN_VERSION tarball has an unexpected SHA-256" >&2
+            exit 1
+        fi
+        tar -xzf mbpfan.tar.gz
+        make -C "$src" bin/mbpfan >/dev/null
+
+        install -D -m 0755 "$src/bin/mbpfan" /usr/sbin/mbpfan
+        [ -e /etc/mbpfan.conf ] || install -D -m 0644 "$src/mbpfan.conf" /etc/mbpfan.conf
+        install -D -m 0644 "$src/mbpfan.depend.conf" /usr/lib/modules-load.d/mbpfan.depend.conf
+        install -D -m 0644 "$src/mbpfan.service" /usr/lib/systemd/system/mbpfan.service
+        install -D -m 0644 "$src/mbpfan.8.gz" /usr/share/man/man8/mbpfan.8.gz
+    ) || rc=1
+    rm -rf -- "$work"
+    [ "$rc" -eq 0 ] || return 1
+
+    # Files written by install(1) take their directory's SELinux label, which
+    # is the right one here; restorecon only makes sure of it.
+    if have restorecon; then
+        restorecon -F /usr/sbin/mbpfan /etc/mbpfan.conf \
+            /usr/lib/modules-load.d/mbpfan.depend.conf \
+            /usr/lib/systemd/system/mbpfan.service 2>/dev/null || true
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 step "Installing mbpfan"
 
 # On Enterprise Linux mbpfan can only come from EPEL, so there is no point
@@ -126,12 +176,24 @@ elif ! pkg_available mbpfan; then
     # derivative may have neither, and EPEL does not rebuild every Fedora
     # package for every Enterprise Linux release. Say so plainly instead of
     # letting the package manager fail with "no match for argument: mbpfan".
-    error "mbpfan is not available in this system's repositories."
-    echo
-    info "Upstream is https://github.com/linux-on-mac/mbpfan and it builds"
-    info "with 'make && sudo make install'. Install it, then re-run this"
-    info "script."
-    DO_FAN=0
+    warn "mbpfan is not available in this system's repositories."
+    info "It can be built from upstream release $MBPFAN_VERSION instead"
+    info "(https://github.com/linux-on-mac/mbpfan, SHA-256 checked)."
+    if confirm "  Build and install mbpfan $MBPFAN_VERSION from source?"; then
+        step "Building mbpfan $MBPFAN_VERSION"
+        if build_mbpfan; then
+            ok "mbpfan $MBPFAN_VERSION installed to /usr/sbin/mbpfan"
+        else
+            error "Building mbpfan failed. To do it by hand:"
+            info "  git clone https://github.com/linux-on-mac/mbpfan && cd mbpfan"
+            info "  make && sudo make install"
+            info "  sudo cp mbpfan.service /etc/systemd/system/ && sudo systemctl daemon-reload"
+            info "then re-run this script."
+            DO_FAN=0
+        fi
+    else
+        DO_FAN=0
+    fi
 else
     pkg_refresh
     pkg_install mbpfan || {
